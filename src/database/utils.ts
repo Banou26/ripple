@@ -1,8 +1,16 @@
-import type { Torrent } from 'webtorrent'
+import { Instance } from "parse-torrent-file"
 
-export const getTorrentFilePieces = (torrent: Torrent, fileIndex: number) => {
+export const getTorrentFilePieces = (torrentFile: Instance, fileIndex: number) => {
+  if (
+    !torrentFile.files
+    || torrentFile.pieces === undefined
+    || torrentFile.pieceLength === undefined
+  ) {
+    throw new Error('torrentFile missing files, pieces or pieceLength')
+  }
+
   const filesByteRanges =
-    torrent.files.reduce(
+    torrentFile.files.reduce(
       (fileRanges, file, index) => [
         ...fileRanges,
         {
@@ -17,22 +25,22 @@ export const getTorrentFilePieces = (torrent: Torrent, fileIndex: number) => {
   const filePieceRanges =
     filesByteRanges.reduce(
       (piecesRanges, fileByteRange) => {
-        const piecesCount = Math.ceil(fileByteRange.end / torrent.pieceLength)
+        const piecesCount = Math.ceil(fileByteRange.end / torrentFile.pieceLength!)
         
         return [
           ...piecesRanges,
           {
             ...fileByteRange,
-            startPieceIndex: Math.round(fileByteRange.start / torrent.pieceLength),
-            isStartPieceMultiFile: !Number.isInteger(fileByteRange.start / torrent.pieceLength),
+            startPieceIndex: Math.round(fileByteRange.start / torrentFile.pieceLength!),
+            isStartPieceMultiFile: !Number.isInteger(fileByteRange.start / torrentFile.pieceLength!),
             endPieceIndex:
-              piecesCount >= torrent.pieces.length - 1
-                ? torrent.pieces.length - 1
+              piecesCount >= torrentFile.pieces!.length - 1
+                ? torrentFile.pieces!.length - 1
                 : piecesCount,
             isEndPieceMultiFile:
               !Number.isInteger(
-                piecesCount >= torrent.pieces.length - 1
-                  ? torrent.pieces.length - 1
+                piecesCount >= torrentFile.pieces!.length - 1
+                  ? torrentFile.pieces!.length - 1
                   : piecesCount
               )
           }
