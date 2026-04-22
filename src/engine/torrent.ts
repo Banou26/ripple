@@ -1,4 +1,4 @@
-import type { LibtorrentSession } from './wasm-loader'
+import type { RippleEngine } from './wasm-loader'
 
 export type FileInfo = {
   index: number
@@ -20,15 +20,15 @@ export type TorrentSnapshot = {
   isPaused: boolean
 }
 
-// One Torrent instance per added torrent. Holds metadata once it's known and
-// exposes the operations the UI needs without leaking the raw session.
+// One Torrent instance per added torrent. Holds metadata once it's known
+// and exposes the operations the UI needs without leaking the raw engine.
 export class Torrent {
   readonly infoHash: string
   files: FileInfo[] = []
   metadataReady = false
 
   constructor (
-    private readonly session: LibtorrentSession,
+    private readonly rt: RippleEngine,
     infoHash: string
   ) {
     this.infoHash = infoHash
@@ -39,42 +39,44 @@ export class Torrent {
     this.metadataReady = true
   }
 
-  status (): TorrentSnapshot {
-    return this.session.torrentStatus(this.infoHash) as TorrentSnapshot
+  status (): Promise<TorrentSnapshot> {
+    return this.rt.status(this.infoHash) as Promise<TorrentSnapshot>
   }
 
-  // Make the file the engine prioritizes. priority=0 disables, 1=normal,
-  // 7=highest. We map "selected for streaming" to 7 and everything else to 0.
-  selectFile (fileIndex: number) {
+  // Priority: 0=none, 1=normal, 2=high, 3=readahead, 4=now.
+  async selectFile (fileIndex: number): Promise<void> {
     for (const f of this.files) {
-      this.session.setFilePriority(this.infoHash, f.index, f.index === fileIndex ? 7 : 0)
+      await this.rt.setFilePriority(this.infoHash, f.index, f.index === fileIndex ? 4 : 0)
     }
   }
 
-  // For streaming: tell libtorrent we want this piece soon. Used by the
-  // ReadableStream adapter to bias the picker toward the current playhead.
-  setPieceDeadline (piece: number, msFromNow: number) {
-    this.session.setPieceDeadline(this.infoHash, piece, msFromNow)
+  // Bias the picker for streaming. `bytes` is the lookahead window from
+  // the current read offset.
+  setReadahead (fileIndex: number, offset: number, bytes: number): Promise<void> {
+    return this.rt.setReadahead(this.infoHash, fileIndex, offset, bytes)
   }
 
-  // Streamable read of a (file, offset, length) byte range. Resolves with
-  // a Uint8Array. The libtorrent side fulfills this via piece reads through
-  // the OPFS disk_interface.
   read (fileIndex: number, offset: number, length: number): Promise<Uint8Array> {
-    return this.session.read(this.infoHash, fileIndex, offset, length)
+    return this.rt.read(this.infoHash, fileIndex, offset, length)
   }
 
-  // ReadableStream over a file, suitable for the media player. Uses
-  // setPieceDeadline to keep the picker honest about the read head.
+  // ReadableStream over a file. Sets a readahead window on open and pulls
+  // fixed-size chunks. anacrolix's Reader blocks on pieces as needed, so
+  // the await on `read` naturally gates on download progress.
   stream (fileIndex: number, opts?: { start?: number, end?: number, chunkSize?: number }): ReadableStream<Uint8Array> {
     const file = this.files[fileIndex]
     if (!file) throw new Error(`unknown file index ${fileIndex}`)
-    const start    = opts?.start ?? 0
-    const end      = opts?.end   ?? file.length
-    const chunk    = opts?.chunkSize ?? 256 * 1024
+    const start = opts?.start ?? 0
+    const end   = opts?.end   ?? file.length
+    const chunk = opts?.chunkSize ?? 256 * 1024
     let offset = start
+    let primed = false
     return new ReadableStream<Uint8Array>({
       pull: async (controller) => {
+        if (!primed) {
+          await this.setReadahead(fileIndex, offset, chunk * 8).catch(() => {})
+          primed = true
+        }
         if (offset >= end) { controller.close(); return }
         const len = Math.min(chunk, end - offset)
         const data = await this.read(fileIndex, offset, len)
@@ -84,7 +86,7 @@ export class Torrent {
     })
   }
 
-  remove (deleteFiles: boolean) {
-    this.session.removeTorrent(this.infoHash, deleteFiles)
+  remove (deleteFiles: boolean): Promise<void> {
+    return this.rt.removeTorrent(this.infoHash, deleteFiles)
   }
 }

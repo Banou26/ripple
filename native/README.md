@@ -1,64 +1,64 @@
-# native/ — libtorrent WebAssembly build
+# native/ — anacrolix/torrent WebAssembly build
 
-This directory builds `libtorrent.wasm` + JS glue from C++ sources. The output
-is consumed by `src/engine/` as a normal ES module.
+This directory builds `torrent.wasm` + the Go runtime glue (`wasm_exec.js`)
+from Go sources that embed [anacrolix/torrent]. The output is consumed by
+`src/engine/` as an opaque wasm module.
 
 ## What it produces
 
-`build/libtorrent.js` and `build/libtorrent.wasm`, with:
+- `build/torrent.wasm` — Go-compiled bittorrent engine (anacrolix/torrent +
+  a thin API wrapper exposing our TS engine's expected surface)
+- `build/wasm_exec.js` — Go's standard wasm runtime glue, copied from the
+  Go toolchain
 
-- **libtorrent 2.x** compiled via Emscripten (pthreads enabled)
-- **Boost** (headers + system + a few static libs) compiled for the
-  `wasm32-unknown-emscripten` target
-- A C++ wrapper (`src/ripple_*.cpp`) exposing a small embind surface that
-  matches the TS engine's expectations
-- A custom `disk_interface` implementation that forwards every read/write to
-  JS callbacks (see `js/disk-library.js`), so storage is OPFS-backed
-- A custom Emscripten socket library (see `js/socket-library.js`) that maps
-  every socket syscall onto `@webvpn/net` and `@webvpn/dgram`
+## Why Go / anacrolix
+
+- `js/wasm` is a first-class build target for `anacrolix/torrent` — the
+  main package, its storage backends, and its DHT all compile cleanly for
+  browsers. No cgo dependencies to wrestle with.
+- Go's WASM runtime multiplexes all goroutines onto a single thread, which
+  matches our "no pthreads, no SharedArrayBuffer" constraint exactly. No
+  COOP/COEP needed at the site level.
+- Single-file output: one `.wasm` + one small JS shim, loaded from a
+  SharedWorker.
 
 ## Build (Docker, recommended)
 
     docker build -t ripple-native .
     docker run --rm -v "$PWD":/work -w /work ripple-native ./build.sh
 
-The output lands in `native/build/`. The repo's `npm run build` (top-level)
-copies those files into `build/` alongside the rest of the app.
+The output lands in `native/build/`. The repo's `npm run build` copies it
+into the app's `build/` tree.
 
-## Build (local, without Docker)
+## Build (local)
 
-You need: Emscripten 3.1.x or newer (`emcc --version`), CMake 3.20+, Python 3,
-and a system Boost source tree. Then:
+Requires Go 1.22+.
 
-    EMSDK=/path/to/emsdk BOOST_ROOT=/path/to/boost ./build.sh
+    ./build.sh
 
-## What is not in here
+## Runtime contract
 
-- `@webvpn/net`, `@webvpn/dgram`, `@fkn/lib`: those stay normal npm deps and
-  are imported by `src/engine/socket-webvpn.ts`. The C++ side never imports
-  them; the socket JS library calls into JS-land where they're available.
-- OPFS: the C++ disk_interface only emits async read/write requests; the JS
-  side handles the actual `FileSystemSyncAccessHandle` calls.
+The wasm module installs a namespace on `globalThis.__ripple` with the
+following methods (all async, returning JS Promises):
 
-## Threading model
+- `addTorrent(input, storageId)` — `input` is a magnet string or Uint8Array
+  (.torrent bytes). Returns the info-hash hex.
+- `removeTorrent(infoHash, deleteFiles)`
+- `setFilePriority(infoHash, fileIndex, priority)` — priority: 0=none, 1..4
+- `setReadahead(infoHash, fileIndex, bytes)` — biases the picker for the
+  currently-playing byte range.
+- `list()` — full snapshot.
+- `status(infoHash)`
+- `read(infoHash, fileIndex, offset, length)` — streaming read, awaits
+  pieces as needed.
+- `subscribe(callback)` — returns an unsubscribe function. Alerts arrive
+  as plain JS objects matching `src/engine/alerts.ts`.
+- `pause()`, `resume()`, `saveState()`, `loadState(bytes)`.
 
-The build is **single-threaded**. No `-pthread`, no SharedArrayBuffer, no
-cross-origin isolation needed. Every blocking native call (socket recv,
-disk read, getaddrinfo) is made from wasm via Asyncify: the wasm stack is
-unwound, the JS promise is awaited, and the stack is rewound on resolve.
+It depends on two JS surfaces that `src/engine/` installs before the wasm
+boots:
 
-Caveat: libtorrent's upstream code spawns a disk worker thread
-(`aux::disk_io_thread`) by default. We swap the entire `disk_io_constructor`
-for our own (`ripple_disk_io_constructor`) so that thread is never created.
-If a different libtorrent code path tries to instantiate a `std::thread`,
-it won't work in this build — patch or replace the offending call site
-(the most common culprits are tracker workers and hasher fan-out, both
-already single-instance in asio-driven code paths).
-
-Trade-off vs pthreads:
-- Piece hashing runs on the main thread (inside Asyncify). Throughput is
-  limited by SHA-1 on a single core — fine for video streaming, noticeable
-  when seeding large libraries.
-- No SharedArrayBuffer means `engine.read()` copies once when transferring
-  bytes across the worker boundary. For 256 KB chunks the overhead is
-  negligible vs the network latency.
+- `globalThis.__ripple_sockets` — TCP dialer + UDP bind; see
+  `src/engine/socket-webvpn.ts`.
+- `globalThis.__ripple_disk` — OPFS-backed storage; see
+  `src/engine/disk-opfs.ts`.

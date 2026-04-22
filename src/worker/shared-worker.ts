@@ -15,7 +15,7 @@
 /// <reference lib="webworker" />
 
 import { Engine } from '../engine'
-import type { Req, Res, Envelope } from './rpc'
+import type { Req, Res, Envelope, ListItem } from './rpc'
 
 declare const self: SharedWorkerGlobalScope
 
@@ -37,41 +37,43 @@ const handle = async (port: MessagePort, env: Envelope<Req>) => {
 
     switch (req.kind) {
       case 'list': {
-        const torrents = engine.list().map(t => ({
-          infoHash: t.infoHash,
-          files: t.files,
-          status: t.status()
-        }))
+        const torrents: ListItem[] = await Promise.all(
+          engine.list().map(async t => ({
+            infoHash: t.infoHash,
+            files: t.files,
+            status: await t.status()
+          }))
+        )
         reply(port, id, { kind: 'list', torrents })
         return
       }
       case 'add': {
-        const t = engine.add(req.input, { storageId: req.storageId })
+        const t = await engine.add(req.input, { storageId: req.storageId })
         reply(port, id, { kind: 'add', infoHash: t.infoHash })
         return
       }
       case 'remove':
-        engine.remove(req.infoHash, req.deleteFiles ?? false)
+        await engine.remove(req.infoHash, req.deleteFiles ?? false)
         reply(port, id, { kind: 'remove' })
         return
       case 'status': {
         const t = engine.get(req.infoHash)
         if (!t) throw new Error(`unknown torrent ${req.infoHash}`)
-        reply(port, id, { kind: 'status', status: t.status() })
+        reply(port, id, { kind: 'status', status: await t.status() })
         return
       }
       case 'select': {
         const t = engine.get(req.infoHash)
         if (!t) throw new Error(`unknown torrent ${req.infoHash}`)
-        t.selectFile(req.fileIndex)
+        await t.selectFile(req.fileIndex)
         reply(port, id, { kind: 'select' })
         return
       }
-      case 'deadline': {
+      case 'readahead': {
         const t = engine.get(req.infoHash)
         if (!t) throw new Error(`unknown torrent ${req.infoHash}`)
-        t.setPieceDeadline(req.piece, req.ms)
-        reply(port, id, { kind: 'deadline' })
+        await t.setReadahead(req.fileIndex, req.offset, req.bytes)
+        reply(port, id, { kind: 'readahead' })
         return
       }
       case 'read': {

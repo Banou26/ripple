@@ -13,7 +13,7 @@ export type Req =
   | { kind: 'remove',  infoHash: string, deleteFiles?: boolean }
   | { kind: 'status',  infoHash: string }
   | { kind: 'select',  infoHash: string, fileIndex: number }
-  | { kind: 'deadline', infoHash: string, piece: number, ms: number }
+  | { kind: 'readahead', infoHash: string, fileIndex: number, offset: number, bytes: number }
   | { kind: 'read',    infoHash: string, fileIndex: number, offset: number, length: number }
   | { kind: 'subscribe' }                       // alerts stream
   | { kind: 'cancel',  subId: number }
@@ -26,7 +26,7 @@ export type Res =
   | { kind: 'remove' }
   | { kind: 'status',   status: TorrentSnapshot }
   | { kind: 'select' }
-  | { kind: 'deadline' }
+  | { kind: 'readahead' }
   | { kind: 'read',     bytes: ArrayBuffer }    // transferable
   | { kind: 'subscribe', subId: number }
   | { kind: 'event',    subId: number, alert: Alert }

@@ -1,54 +1,74 @@
-// Loads the libtorrent.wasm + Emscripten JS glue and returns a typed handle
-// to the embind Session class. The actual file ships as
-// `native/build/libtorrent.js`; the top-level Vite build copies it next to
-// the rest of the app, so at runtime the URL is `/libtorrent.js`.
-//
-// We intentionally keep this a side-effect-free module so callers can decide
-// when to instantiate (cheap in the SharedWorker, never on the main thread).
+// Load the Go-built torrent.wasm and wait for it to install its API on
+// globalThis.__ripple. Shipped flat at site root: /torrent.wasm and
+// /wasm_exec.js. The SharedWorker imports this module.
 
 import { installOpfsDisk }     from './disk-opfs'
 import { installSocketBridge } from './socket-webvpn'
 
-export type LibtorrentSession = {
-  addTorrent (input: string | Uint8Array, storageId: string): string
-  removeTorrent (infoHash: string, deleteFiles: boolean): void
-  setFilePriority (infoHash: string, fileIndex: number, priority: number): void
-  setPieceDeadline (infoHash: string, pieceIndex: number, ms: number): void
-  popAlerts (): unknown[]
-  sessionStats (): unknown
-  torrentStatus (infoHash: string): unknown
-  read (infoHash: string, fileIndex: number, offset: number, length: number): Promise<Uint8Array>
-  pause (): void
-  resume (): void
-  saveState (): Uint8Array
-  loadState (bytes: Uint8Array): void
+// Shape the Go engine installs on globalThis.__ripple. Mirrors native/api.go.
+export type RippleEngine = {
+  addTorrent      (input: string | Uint8Array, storageId: string): Promise<string>
+  removeTorrent   (infoHash: string, deleteFiles: boolean): Promise<void>
+  setFilePriority (infoHash: string, fileIndex: number, priority: number): Promise<void>
+  setReadahead    (infoHash: string, fileIndex: number, offset: number, bytes: number): Promise<void>
+  list            (): Promise<unknown[]>
+  status          (infoHash: string): Promise<unknown>
+  read            (infoHash: string, fileIndex: number, offset: number, length: number): Promise<Uint8Array>
+  subscribe       (cb: (alert: unknown) => void): () => void
+  pause           (): Promise<void>
+  resume          (): Promise<void>
+  saveState       (): Promise<Uint8Array>
+  loadState       (bytes: Uint8Array): Promise<void>
 }
 
-type Factory = (opts?: { locateFile?: (p: string) => string }) =>
-  Promise<{ Session: new () => LibtorrentSession, _malloc: (n: number) => number, _free: (p: number) => void, HEAPU8: Uint8Array }>
+declare global {
+  interface GlobalThis {
+    Go: new () => { importObject: WebAssembly.Imports, run (inst: WebAssembly.Instance): Promise<void> }
+    __ripple: RippleEngine
+    __ripple_ready?: () => void
+  }
+}
 
-let cached: Promise<{ session: LibtorrentSession }> | null = null
+let cached: Promise<RippleEngine> | null = null
 
-export const loadLibtorrent = (): Promise<{ session: LibtorrentSession }> => {
+export const loadEngine = (): Promise<RippleEngine> => {
   if (cached) return cached
   cached = (async () => {
-    // Bridges must be installed *before* the wasm module starts pumping
-    // alerts or trying to open sockets.
+    // Bridges must be installed before the wasm boots — Go's main() calls
+    // into them during engine construction (ListenUDP, etc.).
     installOpfsDisk()
     installSocketBridge()
 
-    // @ts-expect-error: built artifact ships separately at /libtorrent.js
-    const mod = await import(/* @vite-ignore */ '/libtorrent.js') as { default: Factory }
-    const inst = await mod.default({
-      locateFile: (p) => p.endsWith('.wasm') ? '/libtorrent.wasm' : '/' + p
-    })
-    // Expose heap helpers globally — disk-opfs.ts uses them when fulfilling
-    // synchronous reads from the wasm side.
-    ;(globalThis as any)._malloc = inst._malloc
-    ;(globalThis as any)._free   = inst._free
-    ;(globalThis as any).HEAPU8  = inst.HEAPU8
+    // Load Go's runtime glue. wasm_exec.js exposes `globalThis.Go`.
+    await loadScript('/wasm_exec.js')
 
-    return { session: new inst.Session() }
+    // The Go runtime calls __ripple_ready after installAPI finishes, which
+    // is our signal that the methods are safe to use.
+    const ready = new Promise<void>((resolve) => {
+      ;(globalThis as any).__ripple_ready = () => resolve()
+    })
+
+    const Go: any = (globalThis as any).Go
+    const go = new Go()
+    const src = await fetch('/torrent.wasm')
+    const { instance } = await WebAssembly.instantiateStreaming(src, go.importObject)
+    // Run without awaiting — Go's main() parks on select{} forever.
+    void go.run(instance)
+
+    await ready
+    return (globalThis as any).__ripple as RippleEngine
   })()
   return cached
 }
+
+const loadScript = (src: string): Promise<void> => new Promise((resolve, reject) => {
+  // In a worker context, importScripts is the only way to load classic JS
+  // (wasm_exec.js is not an ES module). The SharedWorker entry runs this
+  // module, and importScripts is available on WorkerGlobalScope.
+  try {
+    ;(self as any).importScripts(src)
+    resolve()
+  } catch (e) {
+    reject(e as Error)
+  }
+})

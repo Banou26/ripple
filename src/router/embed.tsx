@@ -136,15 +136,12 @@ const Player = () => {
   const jassubModernWasmUrl = useMemo(() => assetUrl('jassub-worker-modern.wasm'), [])
 
   // Streaming read: hand the player a function that pulls bytes via the
-  // engine. We bias the picker toward the upcoming bytes by setting a
-  // piece deadline based on read offset.
+  // engine. We bias the picker toward the upcoming bytes via readahead.
   const read = useMemo(() => async (offset: number, size: number) => {
     if (!infoHash || !selectedFile) throw new Error('torrent not ready')
-    if (pieceLengthRef.current && status?.totalWanted) {
-      const piece = Math.floor((selectedFile ? 0 : 0 + offset) / pieceLengthRef.current)
-      // 5s deadline: the player wants this *now*, but tolerate jitter.
-      try { await engine.deadline(infoHash, piece, 5000) } catch {}
-    }
+    // Push an 8-chunk readahead window from the current offset. anacrolix's
+    // Reader uses this to raise piece priorities to "Now".
+    try { await engine.readahead(infoHash, fileIndex, offset, size * 8) } catch {}
     const data = await engine.read(infoHash, fileIndex, offset, size)
     // Always return a fresh ArrayBuffer (not SharedArrayBuffer) — the
     // media player expects the non-shared variant.

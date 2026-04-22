@@ -79,8 +79,8 @@ export class EngineClient {
     await this.send({ kind: 'select', infoHash, fileIndex })
   }
 
-  async deadline (infoHash: string, piece: number, ms: number): Promise<void> {
-    await this.send({ kind: 'deadline', infoHash, piece, ms })
+  async readahead (infoHash: string, fileIndex: number, offset: number, bytes: number): Promise<void> {
+    await this.send({ kind: 'readahead', infoHash, fileIndex, offset, bytes })
   }
 
   async read (infoHash: string, fileIndex: number, offset: number, length: number): Promise<Uint8Array> {

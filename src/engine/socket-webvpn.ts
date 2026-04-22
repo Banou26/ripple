@@ -1,25 +1,22 @@
-// Bridge between the Emscripten socket library (native/js/socket-library.js)
-// and @webvpn/net + @webvpn/dgram. Installed on globalThis.__ripple_sockets.
+// Bridge between the Go engine (native/net_js.go) and @webvpn/net +
+// @webvpn/dgram. Installed on globalThis.__ripple_sockets before the wasm
+// module boots.
 //
-// The contract the JS library relies on:
+// Contract the Go side depends on:
 //
 //   tcpConnect({ host, port }) -> Promise<{
 //     readable: ReadableStream<Uint8Array>,
-//     writable: { write(Uint8Array): Promise<void>, close(): Promise<void> },
+//     writable: { write(u8): Promise<void>, close(): Promise<void> },
 //     close(): Promise<void>
 //   }>
 //
 //   udpBind({ host, port }) -> Promise<{
-//     send(data: Uint8Array, dst: { host, port }): Promise<void>,
-//     packets: AsyncIterable<{ data: Uint8Array, from: { host, port } }>,
+//     send(u8, {host, port}): Promise<void>,
+//     recv(): Promise<{data: Uint8Array, from: {host, port}} | null>,
 //     close(): Promise<void>
 //   }>
 //
-//   resolve(host) -> Promise<string[]>  // dotted-quad strings
-//
-// @webvpn/net's API surface is Node-net-shaped (createConnection returning a
-// Duplex-like). We adapt it to ReadableStream/AsyncIterable here so the JS
-// library doesn't need to know about Node streams.
+//   resolve(host) -> Promise<string[]>   // dotted-quad strings
 
 // @ts-ignore — package ships no types
 import * as webvpnNet from '@webvpn/net'
@@ -76,47 +73,37 @@ const udpBind = async (local: Addr) => {
     sock.once('error', reject)
   })
 
+  // Bounded queue; the Go drain pulls with recv() as fast as it can.
   const queue: { data: Uint8Array, from: Addr }[] = []
-  let waiter: ((v: IteratorResult<{ data: Uint8Array, from: Addr }>) => void) | null = null
+  let waiter: ((v: { data: Uint8Array, from: Addr } | null) => void) | null = null
   let closed = false
 
   sock.on('message', (msg: Uint8Array, rinfo: { address: string, port: number }) => {
     const u8 = new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength)
     const item = { data: u8, from: { host: rinfo.address, port: rinfo.port } }
-    if (waiter) { const w = waiter; waiter = null; w({ value: item, done: false }) }
+    if (waiter) { const w = waiter; waiter = null; w(item) }
     else queue.push(item)
   })
-
-  const packets: AsyncIterable<{ data: Uint8Array, from: Addr }> = {
-    [Symbol.asyncIterator] () {
-      return {
-        next () {
-          if (closed) return Promise.resolve({ value: undefined as any, done: true })
-          if (queue.length) return Promise.resolve({ value: queue.shift()!, done: false })
-          return new Promise(resolve => { waiter = resolve })
-        }
-      }
-    }
-  }
 
   return {
     send: (data: Uint8Array, dst: Addr) => new Promise<void>((resolve, reject) => {
       sock.send(data, 0, data.byteLength, dst.port, dst.host, (err: Error | null) =>
         err ? reject(err) : resolve())
     }),
-    packets,
+    recv: () => new Promise<{ data: Uint8Array, from: Addr } | null>(resolve => {
+      if (closed) return resolve(null)
+      if (queue.length) return resolve(queue.shift()!)
+      waiter = resolve
+    }),
     close: () => new Promise<void>(resolve => {
       closed = true
-      if (waiter) { const w = waiter; waiter = null; w({ value: undefined as any, done: true }) }
+      if (waiter) { const w = waiter; waiter = null; w(null) }
       sock.close(() => resolve())
     })
   }
 }
 
-// Tracker URLs come back from libtorrent fully-formed and DNS resolution
-// runs through Emscripten's getaddrinfo override. @webvpn/net itself accepts
-// hostnames, so for resolve() we just return the input — actual resolution
-// happens inside the proxy.
+// DNS resolution goes through the proxy; we just pass the hostname through.
 const resolve = async (host: string): Promise<string[]> => [host]
 
 export const installSocketBridge = () => {

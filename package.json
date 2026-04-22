@@ -21,7 +21,7 @@
     "preview": "vite preview",
     "build-native": "cd native && ./build.sh && cd ..",
     "build-native-docker": "cd native && docker build -t ripple-native . && docker run --rm -v \"$PWD\":/work -w /work ripple-native ./build.sh && cd ..",
-    "copy-native": "shx cp native/build/libtorrent.js build/libtorrent.js && shx cp native/build/libtorrent.wasm build/libtorrent.wasm && shx cp native/build/libtorrent.worker.js build/libtorrent.worker.js 2>/dev/null || true",
+    "copy-native": "shx cp native/build/torrent.wasm build/torrent.wasm && shx cp native/build/wasm_exec.js build/wasm_exec.js",
     "copy-html": "shx cp src/index.html build/index.html && shx cp src/app.webmanifest build/app.webmanifest && copyfiles -u 2 ./src/assets/* build/assets",
     "copy-media-player": "copyfiles -u 4 ./node_modules/@banou/media-player/build/* build/tmp && shx rm build/tmp/index.js && shx mv build/tmp/* build && shx rm -rf build/tmp",
     "build-deps": "npm run build-deps-media-player && npm run build-deps-fkn-lib",

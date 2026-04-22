@@ -15,26 +15,12 @@ export default defineConfig((env) => ({
       entry: ['src/index.tsx'],
       formats: ['es']
     },
-    rollupOptions: {
-      // libtorrent.js is built separately by `npm run build-native` and
-      // copied next to the app at /libtorrent.js. Keep it external so
-      // Rollup doesn't try to resolve it at bundle time.
-      external: [/^\/libtorrent\.js$/]
-    }
   },
   worker: {
-    format: 'es',
-    rollupOptions: {
-      external: [/^\/libtorrent\.js$/]
-    }
+    format: 'es'
   },
   define: {
     'process.env.NODE_ENV': JSON.stringify(env.mode)
-  },
-  optimizeDeps: {
-    // The libtorrent.wasm module is loaded dynamically from /libtorrent.js
-    // at runtime; don't try to pre-bundle it.
-    exclude: ['/libtorrent.js']
   },
   plugins: [
     react({ jsxImportSource: '@emotion/react' })
