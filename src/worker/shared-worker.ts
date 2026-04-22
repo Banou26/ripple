@@ -78,9 +78,9 @@ const handle = async (port: MessagePort, env: Envelope<Req>) => {
         const t = engine.get(req.infoHash)
         if (!t) throw new Error(`unknown torrent ${req.infoHash}`)
         const u8 = await t.read(req.fileIndex, req.offset, req.length)
-        // Always copy into a fresh ArrayBuffer (libtorrent's pthreads build
-        // makes the underlying buffer SharedArrayBuffer, which can't be
-        // transferred). Keeps the wire type concrete.
+        // Copy into a fresh ArrayBuffer so it's transferable across the
+        // MessagePort. The wasm heap is a plain ArrayBuffer in this
+        // single-threaded build, but we can't transfer the heap itself.
         const buf = new ArrayBuffer(u8.byteLength)
         new Uint8Array(buf).set(u8)
         reply(port, id, { kind: 'read', bytes: buf }, [buf])

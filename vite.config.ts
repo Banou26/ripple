@@ -1,26 +1,10 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// libtorrent.wasm + Emscripten pthreads need cross-origin isolation. The
-// dev server and any reverse proxy that fronts production must serve these
-// headers on every response (HTML, JS, wasm, workers).
-const crossOriginIsolation = {
-  name: 'cross-origin-isolation',
-  configureServer (server: any) {
-    server.middlewares.use((_req: any, res: any, next: any) => {
-      res.setHeader('Cross-Origin-Opener-Policy',   'same-origin')
-      res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
-      next()
-    })
-  },
-  configurePreviewServer (server: any) {
-    server.middlewares.use((_req: any, res: any, next: any) => {
-      res.setHeader('Cross-Origin-Opener-Policy',   'same-origin')
-      res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
-      next()
-    })
-  }
-}
+// Single-threaded build: no pthreads, no SharedArrayBuffer, so no
+// Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy needed. The
+// libtorrent.wasm module runs on a single thread and uses Asyncify for
+// every blocking syscall (socket recv, disk I/O, getaddrinfo).
 
 export default defineConfig((env) => ({
   build: {
@@ -52,14 +36,7 @@ export default defineConfig((env) => ({
     // at runtime; don't try to pre-bundle it.
     exclude: ['/libtorrent.js']
   },
-  server: {
-    headers: {
-      'Cross-Origin-Opener-Policy':   'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp'
-    }
-  },
   plugins: [
-    react({ jsxImportSource: '@emotion/react' }),
-    crossOriginIsolation
+    react({ jsxImportSource: '@emotion/react' })
   ]
 }))

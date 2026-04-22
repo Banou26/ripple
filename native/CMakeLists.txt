@@ -36,27 +36,35 @@ target_compile_definitions(libtorrent PRIVATE
   TORRENT_USE_OPENSSL=0
   TORRENT_USE_LIBCRYPTO=0
   TORRENT_DISABLE_ENCRYPTION=0
+  # We build single-threaded. libtorrent's default asio uses one
+  # io_context and doesn't *need* worker threads — our disk_io_constructor
+  # posts all jobs back onto the io_context, so the file-I/O thread pool
+  # that libtorrent spins up by default is unused. If upstream libtorrent
+  # instantiates a std::thread somewhere in a code path we hit, that's a
+  # real porting task; patch it or guard with TORRENT_SINGLE_THREADED in a
+  # downstream fork. For the MVP we rely on Asyncify + the fact that our
+  # replaced disk/socket layers never cross thread boundaries.
 )
 
 # Emscripten link flags.
 # - MODULARIZE: ES module factory (await default()).
 # - EXPORT_ES6: ESM output, plays well with Vite.
-# - USE_PTHREADS: libtorrent needs threads.
-# - PTHREAD_POOL_SIZE: pre-spawn workers; libtorrent uses ~4 threads steady.
 # - ALLOW_MEMORY_GROWTH: torrents need elastic heap.
 # - --bind: enable embind for C++ <-> JS.
 # - --js-library: our socket + disk shim libraries.
+# - ASYNCIFY: we don't use pthreads — every blocking JS call (socket recv,
+#   disk read/write, getaddrinfo) suspends the single wasm thread via
+#   Asyncify. COOP/COEP aren't required because there's no SharedArray
+#   Buffer and no worker pool.
 # - EXPORTED_RUNTIME_METHODS: exposed for the TS engine.
 # - INITIAL_MEMORY: enough headroom for libtorrent + Boost statics.
 target_link_options(libtorrent PRIVATE
   "SHELL:-s MODULARIZE=1"
   "SHELL:-s EXPORT_ES6=1"
-  "SHELL:-s USE_PTHREADS=1"
-  "SHELL:-s PTHREAD_POOL_SIZE=8"
   "SHELL:-s ALLOW_MEMORY_GROWTH=1"
   "SHELL:-s INITIAL_MEMORY=67108864"
   "SHELL:-s STACK_SIZE=1048576"
-  "SHELL:-s ENVIRONMENT=worker"
+  "SHELL:-s ENVIRONMENT=worker,web"
   "SHELL:-s EXPORT_NAME=createLibtorrent"
   "SHELL:-s WASM_BIGINT=1"
   "SHELL:-s ASYNCIFY=1"

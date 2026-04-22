@@ -8,6 +8,5 @@ local EMSDK = [ os.environ EMSDK ] ;
 using emscripten
   : 3.1.64
   : "$(EMSDK)/upstream/emscripten/em++"
-  : <cxxflags>"-std=c++17 -fPIC -pthread"
-    <linkflags>"-pthread"
+  : <cxxflags>"-std=c++17 -fPIC"
   ;

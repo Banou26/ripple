@@ -26,11 +26,11 @@ if [ ! -f "${B2_BUILD_DIR}/.stamp" ]; then
   ./b2 \
     toolset=emscripten \
     link=static \
-    threading=multi \
+    threading=single \
     --with-system \
     --build-dir="${B2_BUILD_DIR}" \
     --stagedir="${B2_BUILD_DIR}/stage" \
-    cxxflags="-std=c++17 -fPIC -pthread" \
+    cxxflags="-std=c++17 -fPIC" \
     -j"$(nproc)"
   touch "${B2_BUILD_DIR}/.stamp"
   popd >/dev/null

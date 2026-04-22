@@ -39,6 +39,26 @@ and a system Boost source tree. Then:
   them; the socket JS library calls into JS-land where they're available.
 - OPFS: the C++ disk_interface only emits async read/write requests; the JS
   side handles the actual `FileSystemSyncAccessHandle` calls.
-- Threading: the build enables `-pthread`. The runtime needs cross-origin
-  isolation (`COOP: same-origin`, `COEP: require-corp`) — see
-  `vite.config.ts`.
+
+## Threading model
+
+The build is **single-threaded**. No `-pthread`, no SharedArrayBuffer, no
+cross-origin isolation needed. Every blocking native call (socket recv,
+disk read, getaddrinfo) is made from wasm via Asyncify: the wasm stack is
+unwound, the JS promise is awaited, and the stack is rewound on resolve.
+
+Caveat: libtorrent's upstream code spawns a disk worker thread
+(`aux::disk_io_thread`) by default. We swap the entire `disk_io_constructor`
+for our own (`ripple_disk_io_constructor`) so that thread is never created.
+If a different libtorrent code path tries to instantiate a `std::thread`,
+it won't work in this build — patch or replace the offending call site
+(the most common culprits are tracker workers and hasher fan-out, both
+already single-instance in asio-driven code paths).
+
+Trade-off vs pthreads:
+- Piece hashing runs on the main thread (inside Asyncify). Throughput is
+  limited by SHA-1 on a single core — fine for video streaming, noticeable
+  when seeding large libraries.
+- No SharedArrayBuffer means `engine.read()` copies once when transferring
+  bytes across the worker boundary. For 256 KB chunks the overhead is
+  negligible vs the network latency.
