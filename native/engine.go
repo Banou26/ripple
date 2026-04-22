@@ -78,6 +78,15 @@ func NewEngine() (*Engine, error) {
 	// Left as a stub in this commit so the scaffold compiles and peer
 	// connections over HTTP trackers + TCP peers work end-to-end; DHT
 	// discovery lights up after this TODO is closed.
+	//
+	// Size note: anacrolix hard-imports github.com/pion/webrtc/v4 +
+	// anacrolix/torrent/webtorrent from its webrtc.go / wstracker.go with
+	// no build tag, which drags pion (~3-4 MB of the wasm) in even when
+	// we don't use webtorrent peers. If binary size becomes a problem,
+	// options are: (1) brotli on the wire (already configured, 3.3 MB),
+	// (2) fork anacrolix to gate webrtc.go behind a `no_webrtc` tag,
+	// (3) lazy-load the wasm (it already downloads on first RPC call,
+	// so HOME doesn't pay the cost until the user plays something).
 
 	e := &Engine{
 		client:   c,

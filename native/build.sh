@@ -31,4 +31,14 @@ else
 fi
 
 ls -lh build/torrent.wasm build/wasm_exec.js
+
+# Precompress. Most static hosts (nginx gzip_static / brotli_static,
+# Cloudflare, Netlify, Vercel) will pick the .br or .gz variant
+# automatically when the client's Accept-Encoding allows. Brotli q=11 is
+# ~30% smaller than gzip for Go wasm. If the tools aren't installed we
+# skip silently; the host can do it at serve time.
+gzip   -9  -k -f build/torrent.wasm                                 2>/dev/null || true
+brotli -q 11 -f build/torrent.wasm -o build/torrent.wasm.br         2>/dev/null || true
+ls -lh build/torrent.wasm* 2>/dev/null
+
 echo "OK: native/build/torrent.{wasm,js}"
