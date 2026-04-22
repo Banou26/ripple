@@ -48,8 +48,7 @@ func NewEngine() (*Engine, error) {
 	cfg.NoDHT = false
 	cfg.Seed = true
 
-	// HTTP-based trackers and webseeds use these DialContext hooks — easy
-	// wins, straight drop-in.
+	// HTTP-based trackers and webseed fetches reuse the same jsDialer.
 	cfg.TrackerDialContext = (&jsDialer{}).DialContext
 	cfg.HTTPDialContext    = (&jsDialer{}).DialContext
 
@@ -67,26 +66,13 @@ func NewEngine() (*Engine, error) {
 	c.AddDialer(torrent.NetworkDialer{Network: "tcp", Dialer: &jsDialer{}})
 
 	// TODO(go-wasm): DHT + UDP tracker wiring. anacrolix's UDP side
-	// normally reuses the same socket for utp peers and DHT. In this
-	// build we've disabled uTP, so DHT needs its own net.PacketConn. The
-	// wiring is:
+	// normally reuses the same socket for utp peers and DHT. We've
+	// disabled uTP, so DHT needs its own net.PacketConn:
 	//
 	//   pc, err := ListenUDP()       // already defined in net_js.go
 	//   ds, err := c.NewAnacrolixDhtServer(pc)
-	//   // ... register ds somewhere reachable for tracker announce
 	//
-	// Left as a stub in this commit so the scaffold compiles and peer
-	// connections over HTTP trackers + TCP peers work end-to-end; DHT
-	// discovery lights up after this TODO is closed.
-	//
-	// Size note: anacrolix hard-imports github.com/pion/webrtc/v4 +
-	// anacrolix/torrent/webtorrent from its webrtc.go / wstracker.go with
-	// no build tag, which drags pion (~3-4 MB of the wasm) in even when
-	// we don't use webtorrent peers. If binary size becomes a problem,
-	// options are: (1) brotli on the wire (already configured, 3.3 MB),
-	// (2) fork anacrolix to gate webrtc.go behind a `no_webrtc` tag,
-	// (3) lazy-load the wasm (it already downloads on first RPC call,
-	// so HOME doesn't pay the cost until the user plays something).
+	// Left as a stub; HTTP trackers + TCP peers work without it.
 
 	e := &Engine{
 		client:   c,
