@@ -1,46 +1,21 @@
-import { css } from '@emotion/react'
+// Mount: top-level provider. The previous implementation enforced a single
+// active tab via BroadcastChannel because webtorrent + OPFS couldn't share
+// state across tabs. With the new SharedWorker engine, that's gone — every
+// tab attaches to the same worker and the worker owns OPFS and the session.
+
+import { useMemo } from 'react'
 
 import Router from '../router'
-import { createWebtorrent, WebTorrentContext } from '../utils/torrent'
-import { useActiveWindow } from '../utils/active-window-effect'
-
-const style = css`
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  align-items: center;
-  height: 100%;
-  width: 100%;
-
-  & > div {
-    margin: 1rem;
-  }
-`
+import { EngineContext } from '../hooks/use-engine'
+import { getEngineClient } from '../worker/client'
 
 const Mount = () => {
-  const { isActive, value, activate } = useActiveWindow({
-    onActive: () => createWebtorrent(),
-    onInactive: (webtorrent) => webtorrent?.destroy()
-  })
-
-  if (!isActive) {
-    return (
-      <div css={style}>
-        <div>Only one page can be active at a time.</div>
-        <div>Do you want this tab/window to take over? It will stop the other tab/window.</div>
-        <div>
-          <button onClick={activate}>Yes, take over</button>
-        </div>
-      </div>
-    )
-  }
-
+  const engine = useMemo(() => getEngineClient(), [])
   return (
-    <WebTorrentContext.Provider value={value}>
+    <EngineContext.Provider value={engine}>
       <Router/>
-    </WebTorrentContext.Provider>
+    </EngineContext.Provider>
   )
 }
-
 
 export default Mount

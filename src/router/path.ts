@@ -8,9 +8,11 @@ export enum Route {
 }
 
 const Routes = {
-  [Route.HOME]: () => '/',
-  [Route.WATCH]: ({ infoHash, fileIndex }: { infoHash: string, fileIndex?: number }) => `/watch/${infoHash}/${fileIndex}`,
-  [Route.EMBED]: (options: { magnet: string, fileIndex?: string } | { torrentFile: string, fileIndex?: string }) => `/embed?${new URLSearchParams(options).toString()}`
+  [Route.HOME]: (_?: void) => '/',
+  [Route.WATCH]: ({ infoHash, fileIndex }: { infoHash: string, fileIndex?: number }) => `/watch/${infoHash}/${fileIndex ?? 0}`,
+  [Route.EMBED]: (options: { magnet: string, fileIndex?: string } | { torrentFile: string, fileIndex?: string }) => `/embed?${new URLSearchParams(options as Record<string, string>).toString()}`,
+  [Route.FILE_HANDLER]: (_?: void) => '/file-handler',
+  [Route.PROTOCOL_HANDLER]: (_?: void) => '/protocol-handler'
 } as const
 
 const RouterRoutes = {

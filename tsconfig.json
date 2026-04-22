@@ -2,17 +2,22 @@
   "compilerOptions": {
     "module": "esnext",
     "target": "ESNext",
-    "lib": ["dom", "dom.iterable", "esnext"],
+    "lib": ["dom", "dom.iterable", "esnext", "webworker"],
+    "types": ["vite/client", "@types/wicg-file-system-access"],
     "noImplicitAny": false,
     "outDir": "./lib",
     "sourceMap": true,
     "noEmit": true,
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
     "strict": true,
     "strictNullChecks": true,
     "noUncheckedIndexedAccess": true,
-    "jsx": "preserve",
-    "baseUrl": ".",
-  }
+    "skipLibCheck": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@emotion/react",
+    "baseUrl": "."
+  },
+  "include": ["src/**/*"]
 }
