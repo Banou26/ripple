@@ -6,7 +6,7 @@ export default defineConfig({
   timeout: 120_000,
   expect: { timeout: 10_000 },
   reporter: 'line',
-  outputDir: 'test-results/ramp',
+  outputDir: 'test-results/playwright',
   use: {
     baseURL: 'http://127.0.0.1:4560',
     trace: process.env.RIPPLE_BENCH_TRACE === '1' ? 'retain-on-failure' : 'off',
@@ -22,7 +22,7 @@ export default defineConfig({
       name: 'chromium',
       use: {
         ...devices['Desktop Chrome'],
-        launchOptions: { args: ['--enable-experimental-web-platform-features', '--autoplay-policy=no-user-gesture-required'] },
+        launchOptions: { args: ['--autoplay-policy=no-user-gesture-required'] },
       },
     },
     {

@@ -47,6 +47,7 @@ type TraceEvent = {
   id?: number
   bytes?: number
   error?: string
+  url?: string
 }
 
 type RatePoint = TraceTorrent & {
@@ -69,53 +70,7 @@ const installTrace = async (page: Page) => {
     const WrappedWorker = function (scriptURL: string | URL, options?: WorkerOptions) {
       const worker = new NativeWorker(scriptURL, options)
       const workerId = ++nextWorkerId
-
-      worker.addEventListener('message', (event) => {
-        const message = event.data
-        if (!message || typeof message !== 'object' || typeof message.type !== 'string') return
-        if (message.type === 'state') {
-          const torrents = Array.isArray(message.torrents)
-            ? message.torrents.map((torrent: any) => ({
-                handle: torrent.handle,
-                magnet: torrent.magnet,
-                hasMetadata: Boolean(torrent.files),
-                totalDone: torrent.status?.totalDone ?? null,
-                progress: torrent.status?.progress ?? null,
-                downloadRate: torrent.status?.downloadRate ?? null,
-                peers: torrent.status?.numPeers ?? null,
-                state: torrent.status?.state ?? null,
-                paused: torrent.status?.paused ?? null,
-              }))
-            : []
-          record({ workerId, direction: 'in', type: 'state', torrents })
-        } else if (incomingTypes.has(message.type)) {
-          record({
-            workerId,
-            direction: 'in',
-            type: message.type,
-            id: message.id,
-            bytes: message.data?.byteLength,
-            error: message.error ?? message.message,
-          })
-        }
-      })
-
-      const postMessage = worker.postMessage.bind(worker)
-      worker.postMessage = ((message: any, transferOrOptions?: Transferable[] | StructuredSerializeOptions) => {
-        if (message && typeof message === 'object' && outgoingTypes.has(message.type)) {
-          record({
-            workerId,
-            direction: 'out',
-            type: message.type,
-            magnet: message.magnet,
-            id: message.id,
-          })
-        }
-        if (transferOrOptions === undefined) postMessage(message)
-        else if (Array.isArray(transferOrOptions)) postMessage(message, transferOrOptions)
-        else postMessage(message, transferOrOptions)
-      }) as typeof worker.postMessage
-
+      record({ workerId, direction: 'lifecycle', type: 'created', url: String(scriptURL) })
       const terminate = worker.terminate.bind(worker)
       worker.terminate = () => {
         record({ workerId, direction: 'lifecycle', type: 'terminated' })
@@ -127,6 +82,129 @@ const installTrace = async (page: Page) => {
     Object.setPrototypeOf(WrappedWorker, NativeWorker)
     WrappedWorker.prototype = NativeWorker.prototype
     Object.defineProperty(window, 'Worker', { configurable: true, writable: true, value: WrappedWorker })
+
+    const NativeSharedWorker = window.SharedWorker
+    const WrappedSharedWorker = function (scriptURL: string | URL, options?: string | WorkerOptions) {
+      const worker = new NativeSharedWorker(scriptURL, options)
+      const requests = new Map<number, string>()
+      const postMessage = worker.port.postMessage.bind(worker.port)
+      worker.port.postMessage = ((message: any, transfer?: Transferable[]) => {
+        if (message?.kind === 'request' && outgoingTypes.has(message.op)) {
+          requests.set(message.id, message.op)
+          record({
+            workerId: message.engineGeneration,
+            direction: 'out',
+            type: message.op,
+            magnet: message.payload?.magnet,
+            id: message.id,
+          })
+        }
+        if (transfer === undefined) postMessage(message)
+        else postMessage(message, transfer)
+      }) as typeof worker.port.postMessage
+      worker.port.addEventListener('message', (event) => {
+        const message = event.data
+        if (!message || typeof message !== 'object') return
+        if (message.kind === 'event' && message.topic === 'state') {
+          const torrents = Array.isArray(message.payload)
+            ? message.payload.map((torrent: any) => ({
+                handle: torrent.handle,
+                magnet: torrent.magnet,
+                hasMetadata: Boolean(torrent.files),
+                totalDone: torrent.status?.totalDone ?? null,
+                progress: torrent.status?.progress ?? null,
+                downloadRate: torrent.status?.downloadRate ?? null,
+                peers: torrent.status?.numPeers ?? null,
+                state: torrent.status?.state ?? null,
+                paused: torrent.status?.paused ?? null,
+              }))
+            : []
+          record({ workerId: message.engineGeneration, direction: 'in', type: 'state', torrents })
+        } else if (message.kind === 'event' && message.topic === 'phase' && message.payload === 'ready') {
+          record({ workerId: message.engineGeneration, direction: 'in', type: 'ready' })
+        } else if (message.kind === 'event' && incomingTypes.has(message.topic)) {
+          record({ workerId: message.engineGeneration, direction: 'in', type: message.topic, error: message.payload })
+        } else if (message.kind === 'response') {
+          const op = requests.get(message.id)
+          if (!op) return
+          record({
+            workerId: message.engineGeneration,
+            direction: 'in',
+            type: message.ok ? `${op}-result` : `${op}-error`,
+            id: message.id,
+            bytes: message.value?.byteLength,
+            error: message.error,
+          })
+          requests.delete(message.id)
+        }
+      })
+      return worker
+    } as unknown as typeof SharedWorker
+
+    Object.setPrototypeOf(WrappedSharedWorker, NativeSharedWorker)
+    WrappedSharedWorker.prototype = NativeSharedWorker.prototype
+    Object.defineProperty(window, 'SharedWorker', { configurable: true, writable: true, value: WrappedSharedWorker })
+
+    const NativeMessageChannel = window.MessageChannel
+    const WrappedMessageChannel = function () {
+      const channel = new NativeMessageChannel()
+      const requests = new Map<number, string>()
+      const postMessage = channel.port1.postMessage.bind(channel.port1)
+      channel.port1.postMessage = ((message: any, transfer?: Transferable[]) => {
+        if (message?.kind === 'request' && outgoingTypes.has(message.op)) {
+          requests.set(message.id, message.op)
+          record({
+            workerId: message.engineGeneration ?? 1,
+            direction: 'out',
+            type: message.op,
+            magnet: message.payload?.magnet,
+            id: message.id,
+          })
+        }
+        if (transfer === undefined) postMessage(message)
+        else postMessage(message, transfer)
+      }) as typeof channel.port1.postMessage
+      channel.port1.addEventListener('message', (event) => {
+        const message = event.data
+        if (!message || typeof message !== 'object') return
+        if (message.kind === 'event' && message.topic === 'state') {
+          const torrents = Array.isArray(message.payload)
+            ? message.payload.map((torrent: any) => ({
+                handle: torrent.handle,
+                magnet: torrent.magnet,
+                hasMetadata: Boolean(torrent.files),
+                totalDone: torrent.status?.totalDone ?? null,
+                progress: torrent.status?.progress ?? null,
+                downloadRate: torrent.status?.downloadRate ?? null,
+                peers: torrent.status?.numPeers ?? null,
+                state: torrent.status?.state ?? null,
+                paused: torrent.status?.paused ?? null,
+              }))
+            : []
+          record({ workerId: 1, direction: 'in', type: 'state', torrents })
+        } else if (message.kind === 'event' && message.topic === 'phase' && message.payload === 'ready') {
+          record({ workerId: 1, direction: 'in', type: 'ready' })
+        } else if (message.kind === 'event' && incomingTypes.has(message.topic)) {
+          record({ workerId: 1, direction: 'in', type: message.topic, error: message.payload })
+        } else if (message.kind === 'response') {
+          const op = requests.get(message.id)
+          if (!op) return
+          record({
+            workerId: 1,
+            direction: 'in',
+            type: message.ok ? `${op}-result` : `${op}-error`,
+            id: message.id,
+            bytes: message.value?.byteLength,
+            error: message.error,
+          })
+          requests.delete(message.id)
+        }
+      })
+      return channel
+    } as unknown as typeof MessageChannel
+    Object.setPrototypeOf(WrappedMessageChannel, NativeMessageChannel)
+    WrappedMessageChannel.prototype = NativeMessageChannel.prototype
+    Object.defineProperty(window, 'MessageChannel', { configurable: true, writable: true, value: WrappedMessageChannel })
   }, { incoming: [...tracedIncoming], outgoing: [...tracedOutgoing] })
 
   await page.addInitScript((key) => localStorage.setItem(key, '1'), DEMO_SEEDED_KEY)
@@ -349,32 +427,37 @@ test.describe('torrent ramp', () => {
     if (REQUIRE_BYTES) expect(report.result.finalBytes).toBeGreaterThan(0)
   })
 
-  test('measures the Home to Watch worker reset', async ({ page }, testInfo) => {
+  test('measures Home to Watch engine continuity', async ({ page }, testInfo) => {
     test.setTimeout((BENCH_SECONDS + WARM_TIMEOUT_MS / 1_000 + 90) * 1_000)
     await installTrace(page)
     await page.goto('/')
     await waitForReady(page)
     await submitMagnet(page)
-    const warmed = await waitForTorrent(page, { minBytes: WARM_BYTES, metadata: true }, WARM_TIMEOUT_MS)
+    const warmStartedAt = Date.now()
+    const metadataReady = await waitForTorrent(page, { metadata: true }, WARM_TIMEOUT_MS)
+      .then(() => true, () => false)
+    const warmRemainingMs = Math.max(1, WARM_TIMEOUT_MS - (Date.now() - warmStartedAt))
+    const warmed = metadataReady && await waitForTorrent(page, { minBytes: WARM_BYTES, metadata: true }, warmRemainingMs)
       .then(() => true, () => false)
 
     const beforeWatch = await trace(page)
     const homePoints = torrentPoints(beforeWatch)
     const homeAddAt = beforeWatch.find((event) => event.direction === 'out' && event.type === 'add-magnet')!.at
-    if (!warmed || homePoints.length === 0) {
+    if (!metadataReady || homePoints.length === 0) {
       const report = {
         browser: testInfo.project.name,
-          skippedWatch: `Home did not reach metadata plus ${WARM_BYTES} bytes within ${WARM_TIMEOUT_MS} ms`,
+        skippedWatch: `Home did not reach metadata within ${WARM_TIMEOUT_MS} ms`,
         home: analyze(homePoints, homeAddAt),
         failures: failureEvents(beforeWatch),
       }
       await attachReport(testInfo, 'home-to-watch-ramp', report)
       expect(report.failures).toEqual([])
-      if (REQUIRE_BYTES) expect(warmed).toBe(true)
+      if (REQUIRE_BYTES) expect(metadataReady).toBe(true)
       return
     }
 
-    const homeWorkerId = homePoints.at(-1)!.workerId
+    const engineGeneration = homePoints.at(-1)!.workerId
+    const baseline = homePoints.at(-1)!.totalDone ?? 0
     await page.evaluate(() => {
       const root = window as typeof window & { __ripplePlayingAt?: number | null }
       root.__ripplePlayingAt = null
@@ -382,31 +465,45 @@ test.describe('torrent ramp', () => {
     })
     const watchAt = await page.evaluate(() => performance.now())
     await page.getByRole('link', { name: 'Watch' }).first().click()
-    await waitForTorrent(page, { metadata: true, excludedWorkerId: homeWorkerId }, 60_000)
-    await page.waitForTimeout(BENCH_SECONDS * 1_000)
+    await page.waitForFunction(
+      (generation) => ((window as any).__rippleRamp?.events ?? []).some((event: TraceEvent) =>
+        event.workerId === generation && event.direction === 'out' && event.type === 'read'
+      ),
+      engineGeneration,
+      { timeout: 60_000 },
+    )
+    const firstReadId = await page.evaluate((generation) => ((window as any).__rippleRamp?.events ?? [])
+      .find((event: TraceEvent) => event.workerId === generation && event.direction === 'out' && event.type === 'read')?.id, engineGeneration)
+    await Promise.all([
+      page.waitForTimeout(BENCH_SECONDS * 1_000),
+      page.waitForFunction(
+        (id) => ((window as any).__rippleRamp?.events ?? []).some((event: TraceEvent) =>
+          event.id === id && (event.type === 'read-result' || event.type === 'read-error')
+        ),
+        firstReadId,
+        { timeout: 60_000 },
+      ),
+    ])
 
     const events = await trace(page)
-    const embedWorkerId = torrentPoints(events).find((point) => point.workerId !== homeWorkerId)?.workerId
-    const embedPoints = embedWorkerId === undefined ? [] : torrentPoints(events, embedWorkerId)
-    const firstKnownIndex = embedPoints.findIndex((point) => point.totalDone !== null)
-    const measuredEmbedPoints = firstKnownIndex < 0 ? [] : embedPoints.slice(firstKnownIndex)
-    const embedBaseline = measuredEmbedPoints[0]?.totalDone ?? 0
-    const firstRead = events.find((event) => event.workerId === embedWorkerId && event.direction === 'out' && event.type === 'read')
+    const continuedPoints = torrentPoints(events, engineGeneration).filter((point) => point.at >= watchAt)
+    const firstRead = events.find((event) => event.workerId === engineGeneration && event.direction === 'out' && event.type === 'read')
     const firstReadResult = firstRead
-      ? events.find((event) => event.workerId === embedWorkerId && event.direction === 'in' && event.type === 'read-result' && event.id === firstRead.id)
+      ? events.find((event) => event.workerId === engineGeneration && event.direction === 'in' && event.type === 'read-result' && event.id === firstRead.id)
       : undefined
     const firstReadError = firstRead
-      ? events.find((event) => event.workerId === embedWorkerId && event.direction === 'in' && event.type === 'read-error' && event.id === firstRead.id)
+      ? events.find((event) => event.workerId === engineGeneration && event.direction === 'in' && event.type === 'read-error' && event.id === firstRead.id)
       : undefined
     const playingAt = await page.evaluate(() => (window as any).__ripplePlayingAt as number | null)
     const report = {
       browser: testInfo.project.name,
       secondsAfterWatch: BENCH_SECONDS,
-      homeWorkerId,
-      embedWorkerId: embedWorkerId ?? null,
+      homeWarmed: warmed,
+      engineGeneration,
       home: analyze(homePoints, homeAddAt),
-      embed: analyze(measuredEmbedPoints, watchAt, embedBaseline),
-      homeWorkerTerminated: events.some((event) => event.workerId === homeWorkerId && event.type === 'terminated'),
+      watch: analyze(continuedPoints, watchAt, baseline),
+      torrentWorkerCreations: events.filter((event) => event.type === 'created' && event.url?.includes('/assets/worker-')).length,
+      engineTerminated: events.some((event) => event.workerId === engineGeneration && event.type === 'terminated'),
       firstReadMs: firstRead ? firstRead.at - watchAt : null,
       firstReadResultMs: firstRead && firstReadResult ? firstReadResult.at - firstRead.at : null,
       firstReadBytes: firstReadResult?.bytes ?? 0,
@@ -416,12 +513,12 @@ test.describe('torrent ramp', () => {
     }
     await attachReport(testInfo, 'home-to-watch-ramp', report)
 
-    expect(report.homeWorkerTerminated).toBe(true)
-    expect(embedWorkerId).toBeDefined()
-    expect(measuredEmbedPoints.length).toBeGreaterThan(1)
+    expect(report.engineTerminated).toBe(false)
+    expect(report.torrentWorkerCreations).toBe(1)
+    expect(continuedPoints.length).toBeGreaterThan(1)
     expect(report.failures).toEqual([])
     expect(report.firstReadError).toBeNull()
     expect(report.firstReadBytes).toBeGreaterThan(0)
-    if (REQUIRE_BYTES) expect(report.embed.finalBytes).toBeGreaterThan(0)
+    if (REQUIRE_BYTES) expect(report.watch.finalBytes).toBeGreaterThan(0)
   })
 })

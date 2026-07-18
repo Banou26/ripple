@@ -3,7 +3,7 @@
 // never races the seeding write lock) and streams it straight to a file the user
 // picks - no full-file buffering on the showSaveFilePicker path.
 
-import type { TorrentClient } from './client'
+import type { EngineHandle, TorrentClient } from './client'
 import type { TorrentFile } from './types'
 import { writeZip } from './zip'
 
@@ -54,7 +54,7 @@ const openSink = async (baseName: string): Promise<Sink> => {
 // compression buffering; sizes come straight from the torrent metadata.
 export const saveTorrentAsZipToDisk = async (
   client: TorrentClient,
-  handle: number,
+  ref: EngineHandle,
   torrentName: string,
   files: TorrentFile[],
   onProgress?: (fraction: number) => void,
@@ -66,7 +66,7 @@ export const saveTorrentAsZipToDisk = async (
       files.map((f, index) => ({
         path: f.name,
         size: f.size,
-        read: (offset: number, len: number) => client.read(handle, index, offset, len),
+        read: (offset: number, len: number) => client.read(ref, index, offset, len, false),
       })),
       sink.write,
       onProgress,
@@ -80,7 +80,7 @@ export const saveTorrentAsZipToDisk = async (
 
 export const saveTorrentFileToDisk = async (
   client: TorrentClient,
-  handle: number,
+  ref: EngineHandle,
   fileIndex: number,
   filePath: string,
   fileBytes: number,
@@ -91,7 +91,7 @@ export const saveTorrentFileToDisk = async (
   try {
     for (let offset = 0; offset < fileBytes; offset += CHUNK) {
       const len = Math.min(CHUNK, fileBytes - offset)
-      const chunk = await client.read(handle, fileIndex, offset, len)
+      const chunk = await client.read(ref, fileIndex, offset, len, false)
       await sink.write(chunk)
       onProgress?.((offset + len) / fileBytes)
     }

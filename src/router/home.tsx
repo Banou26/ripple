@@ -994,7 +994,8 @@ const Home = () => {
   }, [addMagnet, showToast])
 
   const addTorrentFiles = useCallback(async (files: Iterable<File>) => {
-    for (const file of [...files]) {
+    const snapshot = Array.from(files)
+    for (const file of snapshot) {
       if (!/\.torrent$/i.test(file.name)) continue
       addTorrentFile(new Uint8Array(await file.arrayBuffer()))
       showToast(`${file.name} added`)
@@ -1027,7 +1028,7 @@ const Home = () => {
       e.preventDefault()
       depth = 0
       setDragging(false)
-      if (e.dataTransfer?.files?.length) addTorrentFiles(e.dataTransfer.files)
+      if (e.dataTransfer?.files?.length) void addTorrentFiles(e.dataTransfer.files)
       else commitMagnet(e.dataTransfer?.getData('text') ?? '')
     }
     window.addEventListener('dragenter', onDragEnter)
@@ -1042,8 +1043,11 @@ const Home = () => {
     }
   }, [addTorrentFiles, commitMagnet])
 
-  const onToggle = (t: Torrent) =>
-    t.state === 'paused' ? resume(Number(t.id)) : pause(Number(t.id))
+  const onToggle = (t: Torrent) => {
+    if (!t.ref) return
+    if (t.state === 'paused') resume(t.ref)
+    else pause(t.ref)
+  }
 
   // A synced "Files missing" torrent has no session handle - start/remove it by
   // infoHash. Starting adds it to the swarm; removing just drops the list entry.
@@ -1052,7 +1056,7 @@ const Home = () => {
   // Removing also wipes the OPFS data - there's no UI to reclaim it otherwise.
   const onRemove = (t: Torrent) => {
     if (t.state === 'missing') { if (t.infoHash) removeMissing(t.infoHash) }
-    else remove(Number(t.id), true)
+    else if (t.ref) remove(t.ref, true)
   }
 
   // Streams one file out of OPFS to the user's disk. Called synchronously
@@ -1060,10 +1064,10 @@ const Home = () => {
   const onSave = (t: Torrent, fileIndex: number) => {
     const client = clientRef.current
     const file = t.files?.[fileIndex]
-    if (!client || !file) return
+    if (!client || !file || !t.ref) return
     const key = savingKey(t.id, fileIndex)
     setSaving((s) => ({ ...s, [key]: 0 }))
-    saveTorrentFileToDisk(client, Number(t.id), fileIndex, file.name, file.size, (f) => setSaving((s) => ({ ...s, [key]: f })))
+    saveTorrentFileToDisk(client, t.ref, fileIndex, file.name, file.size, (f) => setSaving((s) => ({ ...s, [key]: f })))
       .catch(() => {})
       .finally(() => setSaving((s) => { const { [key]: _, ...rest } = s; return rest }))
   }
@@ -1071,10 +1075,10 @@ const Home = () => {
   // Streams every file of a multifile torrent into one zip on the user's disk.
   const onSaveZip = (t: Torrent) => {
     const client = clientRef.current
-    if (!client || !t.files?.length) return
+    if (!client || !t.files?.length || !t.ref) return
     const key = savingKey(t.id, -1)
     setSaving((s) => ({ ...s, [key]: 0 }))
-    saveTorrentAsZipToDisk(client, Number(t.id), t.name, t.files, (f) => setSaving((s) => ({ ...s, [key]: f })))
+    saveTorrentAsZipToDisk(client, t.ref, t.name, t.files, (f) => setSaving((s) => ({ ...s, [key]: f })))
       .catch(() => {})
       .finally(() => setSaving((s) => { const { [key]: _, ...rest } = s; return rest }))
   }
@@ -1092,7 +1096,11 @@ const Home = () => {
       if (t.state !== 'done' && t.state !== 'seeding') continue
       if (!t.files?.length || syncedRef.current.has(t.id)) continue
       syncedRef.current.add(t.id)
-      syncTorrentToDirectory(client, t, folder)
+      const sync = () => syncTorrentToDirectory(client, t, folder)
+      const operation = navigator.locks
+        ? navigator.locks.request(`ripple:folder-sync:${t.id}`, sync)
+        : sync()
+      void operation
         .then((written) => { if (written) showToast(`${t.name} saved to ${folder.name}`) })
         .catch(() => showToast(`Saving ${t.name} to ${folder.name} failed`))
     }
@@ -1143,7 +1151,7 @@ const Home = () => {
             multiple
             style={{ display: 'none' }}
             onChange={(e) => {
-              if (e.currentTarget.files?.length) addTorrentFiles(e.currentTarget.files)
+              if (e.currentTarget.files?.length) void addTorrentFiles(e.currentTarget.files)
               e.currentTarget.value = ''
             }}
           />

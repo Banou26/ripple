@@ -6,43 +6,61 @@ import * as net from '@fkn/lib/net'
 import * as dgram from '@fkn/lib/dgram'
 import { get, set, del, update } from 'idb-keyval'
 import { createSession } from 'libtorrent-wasm'
-import type { Session, TorrentFiles, TorrentStatus } from 'libtorrent-wasm'
+import type { Session } from 'libtorrent-wasm'
 import { OPFSStorage } from 'libtorrent-wasm/opfs'
 
+import type {
+  EngineBootstrapMessage,
+  EngineRequest,
+  EngineResponse,
+  Persisted,
+  TorrentEventTopic,
+  TorrentOperation,
+  TorrentSnapshot,
+} from './protocol'
+
 import { magnetInfoHash } from './magnet'
+import { ENGINE_LOCK_NAME } from './protocol'
 
-const OWN = new Set(['add-magnet', 'add-torrent-file', 'read', 'remove', 'remove-missing', 'set-sequential', 'prioritize-file', 'prioritize-range', 'pause', 'resume', 'import-list', 'clear-list', 'start'])
-
-export type TorrentSnapshot = {
-  handle: number
-  magnet: string
-  files: TorrentFiles | null
-  status: TorrentStatus | null
-  bitfield: { numPieces: number, pieceLength: number, length: number, pieces: Uint8Array } | null
-}
+export type { Persisted, TorrentSnapshot } from './protocol'
 
 const LIST_KEY = 'ripple:torrents'
 const resumeKey = (ih: string) => 'ripple:resume:' + ih
 const torrentKey = (ih: string) => 'ripple:torrent:' + ih
-// started === false marks a torrent synced from another device that this device
-// hasn't downloaded yet: it lives in the list but is NOT added to the session (no
-// swarm, no download) until the user starts it. Absent/true = active here.
-export type Persisted = { infoHash: string, magnet: string, savePath: string, addedAt: number, started?: boolean }
-
 let session: Session | null = null
 const handles: number[] = []
 const magnetByHandle = new Map<number, string>()
 const infoHashByHandle = new Map<number, string>()
 const savePathByHandle = new Map<number, string>()
 const resumeSaved = new Set<number>()
+const backgroundTasks = new Set<Promise<unknown>>()
+let stateTimer: number | undefined
+let resumeTimer: number | undefined
+let controlPort: MessagePort | undefined
+let acceptingRequests = false
+let shuttingDown = false
+let releaseEngineLock: (() => void) | undefined
+let lockAbort: AbortController | undefined
+let mutationQueue = Promise.resolve()
 
-const post = (msg: any, transfer?: Transferable[]) => (self as any).postMessage(msg, transfer ?? [])
+const postEvent = (topic: TorrentEventTopic, payload?: any, transfer?: Transferable[]) =>
+  controlPort?.postMessage({ kind: 'event', topic, payload }, transfer ?? [])
+
+const respond = (response: EngineResponse, transfer?: Transferable[]) =>
+  controlPort?.postMessage(response, transfer ?? [])
+
+const trackTask = <T>(task: Promise<T>): Promise<T> => {
+  backgroundTasks.add(task)
+  void task.finally(() => backgroundTasks.delete(task)).catch(() => {})
+  return task
+}
 
 const snapshot = (): TorrentSnapshot[] =>
   handles.map((h) => {
     const bf = session!.bitfield(h)
     return {
       handle: h,
+      infoHash: infoHashByHandle.get(h) ?? null,
       magnet: magnetByHandle.get(h) ?? '',
       files: session!.files(h),
       status: session!.status(h),
@@ -61,14 +79,14 @@ const upsertList = async (entry: Persisted) => {
     if (i >= 0) list[i] = entry; else list.push(entry)
     return list
   })
-  post({ type: 'list', list })
+  postEvent('list', list)
 }
 const removeFromList = async (ih: string) => {
   let list: Persisted[] = []
   await update<Persisted[]>(LIST_KEY, (prev) => (list = (prev ?? []).filter((e) => e.infoHash !== ih)))
   await del(resumeKey(ih)).catch(() => {})
   await del(torrentKey(ih)).catch(() => {})
-  post({ type: 'list', list })
+  postEvent('list', list)
 }
 
 const track = (h: number, magnet: string, ih: string | null, savePath: string) => {
@@ -83,10 +101,17 @@ const untrack = (h: number) => {
   for (const k of lastReadOffset.keys()) if (k.startsWith(h + ':')) lastReadOffset.delete(k)
 }
 
-const persistResume = async (h: number) => {
+const resolveHandle = (payload: any): number => {
+  const handle = Number(payload?.handle)
+  if (!Number.isInteger(handle) || !handles.includes(handle)) throw new Error('STALE_TORRENT_REF')
+  if (payload?.infoHash && infoHashByHandle.get(handle) !== payload.infoHash) throw new Error('STALE_TORRENT_REF')
+  return handle
+}
+
+const persistResume = async (h: number, timeoutMs?: number) => {
   const ih = infoHashByHandle.get(h)
   if (!ih || !session) return
-  try { await set(resumeKey(ih), await session.saveResumeData(h)) } catch {}
+  try { await set(resumeKey(ih), await session.saveResumeData(h, timeoutMs)) } catch {}
 }
 
 const filePieceRange = (h: number, fileIndex: number) => {
@@ -173,12 +198,14 @@ const opfsAvailable = async (): Promise<boolean> => {
 
 const init = async () => {
   const origErr = console.error.bind(console)
-  console.error = (...args: any[]) => { origErr(...args); try { post({ type: 'worker-error', args: args.map(String) }) } catch {} }
+  console.error = (...args: any[]) => { origErr(...args); try { postEvent('worker-error', args.map(String)) } catch {} }
 
   if (!(await opfsAvailable())) {
-    post({ type: 'storage-unavailable' })
+    postEvent('storage', { available: false })
+    postEvent('phase', 'storage-unavailable')
     return
   }
+  postEvent('storage', { available: true })
 
   session = await createSession({ net, dgram, storage: new OPFSStorage(), utpReceiveBufferBytes: 4_194_304 })
   for (let i = 0; i < 30; i++) session.tick()
@@ -215,152 +242,306 @@ const init = async () => {
     if (changed) await set(LIST_KEY, list)
   } catch (err) { console.error('[worker] restore failed', err) }
 
-  post({ type: 'list', list: await loadList() })
-  post({ type: 'ready' })
+  postEvent('list', await loadList())
+  acceptingRequests = true
+  postEvent('phase', 'ready')
 
-  setInterval(() => {
+  stateTimer = self.setInterval(() => {
     if (!session) return
     session.popAlerts()
     for (const h of handles) session.postStatus(h)
-    post({ type: 'state', torrents: snapshot() })
+    postEvent('state', snapshot())
     // Snapshot resume data the first time a torrent completes, so a reload right
     // after finishing still resumes from OPFS rather than re-downloading.
     for (const h of handles) {
       const st = session.status(h)
       if (st && (st.state === 4 || st.state === 5) && !resumeSaved.has(h)) {
-        resumeSaved.add(h); persistResume(h)
+        resumeSaved.add(h); void trackTask(persistResume(h))
       }
     }
   }, 500)
 
   // Periodic resume snapshot for in-progress torrents.
-  setInterval(() => {
+  resumeTimer = self.setInterval(() => {
     if (!session) return
     for (const h of handles) {
       const st = session.status(h)
-      if (st && st.state === 3) persistResume(h)
+      if (st && st.state === 3) void trackTask(persistResume(h))
     }
   }, 15000)
 }
 
-self.addEventListener('message', async (e: MessageEvent) => {
-  const m = e.data
-  if (!m || typeof m !== 'object' || typeof m.type !== 'string' || !OWN.has(m.type)) return
-  if (!session) { post({ type: 'error', message: 'worker not initialized' }); return }
-  try {
-    if (m.type === 'add-magnet') {
-      const savePath = m.savePath || '/dl'
-      const ih = magnetInfoHash(m.magnet)
-      // /embed re-adds a magnet the init restore already holds; reuse the live handle instead of a duplicate add
-      const existing = ih ? handles.find((h) => infoHashByHandle.get(h) === ih) : undefined
-      if (existing !== undefined) {
-        post({ type: 'added', handle: existing, magnet: magnetByHandle.get(existing) || m.magnet })
-      } else {
-        const h = session.addMagnet(m.magnet, savePath)
-        track(h, m.magnet, ih, savePath)
-        if (ih) await upsertList({ infoHash: ih, magnet: m.magnet, savePath, addedAt: Date.now() })
-        post({ type: 'added', handle: h, magnet: m.magnet })
-      }
-    } else if (m.type === 'add-torrent-file') {
-      const savePath = m.savePath || '/dl'
-      const bytes = m.bytes as Uint8Array
-      const h = session.addTorrentFile(bytes, savePath)
-      track(h, '', null, savePath)
-      // infohash lands with the add alert (popped by the 500ms loop) - poll for it.
-      let ih: string | null = null
-      for (let i = 0; i < 40 && !(ih = session.infohash(h)); i++) await new Promise((r) => setTimeout(r, 250))
-      // The synthesized magnet is the torrent's identity everywhere (list, /embed
-      // URL, player match); the raw .torrent bytes stay the restore source.
-      const magnet = ih ? 'magnet:?xt=urn:btih:' + ih : ''
-      track(h, magnet, ih, savePath)
-      if (ih) {
-        await set(torrentKey(ih), bytes)
-        await upsertList({ infoHash: ih, magnet, savePath, addedAt: Date.now() })
-      }
-      post({ type: 'added', handle: h, magnet })
-    } else if (m.type === 'read') {
-      if (m.prioritize !== false) anchorSequential(m.handle, m.fileIndex, m.offset)
-      // Quiet readers must never block on (or wait for) missing pieces; fail
-      // fast so a background queue can retry once the data lands.
-      else if (!hasBytes(m.handle, m.fileIndex, m.offset, m.len)) {
-        post({ type: 'read-error', id: m.id, error: 'not downloaded' })
-        return
-      }
-      const data = await session.read(m.handle, m.fileIndex, m.offset, m.len)
-      post({ type: 'read-result', id: m.id, data }, [data.buffer])
-    } else if (m.type === 'remove') {
-      const ih = infoHashByHandle.get(m.handle)
-      session.removeTorrent(m.handle, !!m.deleteFiles)
-      untrack(m.handle)
-      if (ih) await removeFromList(ih)
-    } else if (m.type === 'import-list') {
-      // Union by infoHash; cloud-synced entries land as started:false ghosts, never auto-downloaded
-      const incoming: Persisted[] = Array.isArray(m.list) ? m.list : []
-      let list: Persisted[] = []
-      let changed = false
-      await update<Persisted[]>(LIST_KEY, (prev) => {
-        list = prev ?? []
-        const have = new Set(list.map((e) => e.infoHash))
-        for (const e of incoming) {
-          if (!e || typeof e.infoHash !== 'string' || !e.magnet || have.has(e.infoHash)) continue
-          list.push({ infoHash: e.infoHash, magnet: e.magnet, savePath: e.savePath || '/dl', addedAt: e.addedAt || Date.now(), started: false })
-          have.add(e.infoHash)
-          changed = true
-        }
-        return list
-      })
-      if (changed) post({ type: 'list', list })
-    } else if (m.type === 'start') {
-      // The user asked to download a synced "Files missing" torrent: add it to the
-      // session now and mark it started so it survives reloads as an active torrent.
-      const e = (await loadList()).find((x) => x.infoHash === m.infoHash)
-      if (e) {
-        const savePath = e.savePath || '/dl'
-        // Stored .torrent bytes give instant metadata; a cloud-synced ghost has only the magnet
-        const bytes = (await get(torrentKey(e.infoHash))) as Uint8Array | undefined
-        const h = bytes && bytes.byteLength
-          ? session.addTorrentFile(bytes, savePath)
-          : session.addMagnet(e.magnet, savePath)
-        track(h, e.magnet, e.infoHash, savePath)
-        // Post state before flipping the entry so the live row dedups the ghost in the same render
-        post({ type: 'state', torrents: snapshot() })
-        await upsertList({ ...e, started: true })
-      }
-    } else if (m.type === 'remove-missing') {
-      // A ghost started moments earlier still has a live handle; tear it down too or it keeps downloading with no persisted entry
-      if (typeof m.infoHash === 'string') {
-        const h = handles.find((x) => infoHashByHandle.get(x) === m.infoHash)
-        if (h !== undefined) { session.removeTorrent(h, true); untrack(h) }
-        await removeFromList(m.infoHash)
-      }
-    } else if (m.type === 'clear-list') {
-      // Account switch: drop the device-local list and its resume/torrent blobs; OPFS bytes stay on disk
-      for (const h of [...handles]) { session.removeTorrent(h, false); untrack(h) }
-      let dropped: Persisted[] = []
-      await update<Persisted[]>(LIST_KEY, (prev) => { dropped = prev ?? []; return [] })
-      for (const e of dropped) {
-        await del(resumeKey(e.infoHash)).catch(() => {})
-        await del(torrentKey(e.infoHash)).catch(() => {})
-      }
-      post({ type: 'list', list: [] })
-    } else if (m.type === 'pause') {
-      session.pauseTorrent(m.handle)
-      persistResume(m.handle)
-    } else if (m.type === 'resume') {
-      session.resumeTorrent(m.handle)
-    } else if (m.type === 'set-sequential') {
-      session.setSequential(m.handle, m.on)
-    } else if (m.type === 'prioritize-file') {
-      // The offset is the player's linear time->byte estimate; the next read's
-      // anchorSequential re-corrects it with the remuxer's true byte position.
-      prioritizeFile(m.handle, m.fileIndex, m.fromOffset ?? 0)
-    } else if (m.type === 'prioritize-range') {
-      session.prioritizeRange(m.handle, m.fileIndex, m.offset, m.len)
-    }
-  } catch (err: any) {
-    if (m.type === 'read') post({ type: 'read-error', id: m.id, error: String(err?.stack ?? err) })
-    else post({ type: 'error', message: String(err?.stack ?? err) })
-  }
-})
+const clearTimers = () => {
+  if (stateTimer !== undefined) self.clearInterval(stateTimer)
+  if (resumeTimer !== undefined) self.clearInterval(resumeTimer)
+  stateTimer = undefined
+  resumeTimer = undefined
+}
 
-init().catch((e: any) => post({ type: 'error', message: String(e?.stack ?? e) }))
+const persistAll = async () => {
+  if (!session) return
+  await Promise.all(handles.map((handle) => persistResume(handle, 3_000)))
+}
+
+const withAlertPump = async (work: () => Promise<void>) => {
+  const timer = self.setInterval(() => { session?.popAlerts() }, 50)
+  try { await work() } finally { self.clearInterval(timer) }
+}
+
+const checkpoint = async () => {
+  const queued = mutationQueue
+  await withAlertPump(async () => {
+    await queued.catch(() => {})
+    await Promise.allSettled(backgroundTasks)
+    await persistAll()
+  })
+}
+
+const checkpointAndShutdown = async () => {
+  if (shuttingDown) return
+  shuttingDown = true
+  acceptingRequests = false
+  clearTimers()
+  lockAbort?.abort()
+  await withAlertPump(async () => {
+    await mutationQueue.catch(() => {})
+    await Promise.allSettled(backgroundTasks)
+    await persistAll()
+  })
+  try { session?.destroy() } finally {
+    session = null
+    releaseEngineLock?.()
+    releaseEngineLock = undefined
+  }
+}
+
+const handleOperation = async (op: TorrentOperation, payload: any): Promise<any> => {
+  if (op === 'checkpoint') return checkpoint()
+  if (op === 'checkpoint-and-shutdown') return checkpointAndShutdown()
+  if (!session) throw new Error('worker not initialized')
+  const p = payload ?? {}
+
+  if (op === 'add-magnet') {
+    const savePath = p.savePath || '/dl'
+    const ih = magnetInfoHash(p.magnet)
+    const existing = ih ? handles.find((h) => infoHashByHandle.get(h) === ih) : undefined
+    if (existing !== undefined) return { handle: existing, magnet: magnetByHandle.get(existing) || p.magnet }
+    const handle = session.addMagnet(p.magnet, savePath)
+    track(handle, p.magnet, ih, savePath)
+    if (ih) await upsertList({ infoHash: ih, magnet: p.magnet, savePath, addedAt: Date.now() })
+    return { handle, magnet: p.magnet }
+  }
+
+  if (op === 'add-torrent-file') {
+    const savePath = p.savePath || '/dl'
+    const bytes = p.bytes as Uint8Array
+    const handle = session.addTorrentFile(bytes, savePath)
+    if (!Number.isSafeInteger(handle) || handle < 0 || handle > 0x7fffffff) throw new Error('invalid torrent file')
+    track(handle, '', null, savePath)
+    try {
+      let infoHash: string | null = null
+      for (let i = 0; i < 40 && !(infoHash = session.infohash(handle)); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+      if (!infoHash) throw new Error('torrent metadata unavailable')
+      const magnet = 'magnet:?xt=urn:btih:' + infoHash
+      track(handle, magnet, infoHash, savePath)
+      await set(torrentKey(infoHash), bytes)
+      await upsertList({ infoHash, magnet, savePath, addedAt: Date.now() })
+      return { handle, magnet, infoHash }
+    } catch (error) {
+      try { session.removeTorrent(handle, false) } catch {}
+      untrack(handle)
+      throw error
+    }
+  }
+
+  if (op === 'read') {
+    const handle = resolveHandle(p)
+    if (p.prioritize !== false) anchorSequential(handle, p.fileIndex, p.offset)
+    else if (!hasBytes(handle, p.fileIndex, p.offset, p.len)) throw new Error('not downloaded')
+    return session.read(handle, p.fileIndex, p.offset, p.len)
+  }
+
+  if (op === 'remove') {
+    const handle = resolveHandle(p)
+    const ih = infoHashByHandle.get(handle)
+    session.removeTorrent(handle, !!p.deleteFiles)
+    untrack(handle)
+    if (ih) await removeFromList(ih)
+    return
+  }
+
+  if (op === 'import-list') {
+    const incoming: Persisted[] = Array.isArray(p.list) ? p.list : []
+    let list: Persisted[] = []
+    let changed = false
+    await update<Persisted[]>(LIST_KEY, (prev) => {
+      list = prev ?? []
+      const have = new Set(list.map((entry) => entry.infoHash))
+      for (const entry of incoming) {
+        if (!entry || typeof entry.infoHash !== 'string' || !entry.magnet || have.has(entry.infoHash)) continue
+        list.push({ infoHash: entry.infoHash, magnet: entry.magnet, savePath: entry.savePath || '/dl', addedAt: entry.addedAt || Date.now(), started: false })
+        have.add(entry.infoHash)
+        changed = true
+      }
+      return list
+    })
+    if (changed) postEvent('list', list)
+    return
+  }
+
+  if (op === 'start') {
+    const entry = (await loadList()).find((item) => item.infoHash === p.infoHash)
+    if (!entry) return
+    const savePath = entry.savePath || '/dl'
+    const bytes = (await get(torrentKey(entry.infoHash))) as Uint8Array | undefined
+    const handle = bytes?.byteLength
+      ? session.addTorrentFile(bytes, savePath)
+      : session.addMagnet(entry.magnet, savePath)
+    track(handle, entry.magnet, entry.infoHash, savePath)
+    postEvent('state', snapshot())
+    await upsertList({ ...entry, started: true })
+    return
+  }
+
+  if (op === 'remove-missing') {
+    if (typeof p.infoHash !== 'string') return
+    const handle = handles.find((item) => infoHashByHandle.get(item) === p.infoHash)
+    if (handle !== undefined) { session.removeTorrent(handle, true); untrack(handle) }
+    await removeFromList(p.infoHash)
+    return
+  }
+
+  if (op === 'clear-list') {
+    while (handles.length > 0) {
+      const handle = handles[0]!
+      session.removeTorrent(handle, false)
+      untrack(handle)
+    }
+    let dropped: Persisted[] = []
+    await update<Persisted[]>(LIST_KEY, (prev) => { dropped = prev ?? []; return [] })
+    for (const entry of dropped) {
+      await del(resumeKey(entry.infoHash)).catch(() => {})
+      await del(torrentKey(entry.infoHash)).catch(() => {})
+    }
+    postEvent('list', [])
+    return
+  }
+
+  if (op === 'pause') {
+    const handle = resolveHandle(p)
+    session.pauseTorrent(handle)
+    void trackTask(persistResume(handle))
+    return
+  }
+  if (op === 'resume') { session.resumeTorrent(resolveHandle(p)); return }
+  if (op === 'prioritize-file') {
+    prioritizeFile(resolveHandle(p), p.fileIndex, p.fromOffset ?? 0)
+    return
+  }
+  if (op === 'prioritize-range') {
+    session.prioritizeRange(resolveHandle(p), p.fileIndex, p.offset, p.len)
+    return
+  }
+
+  if (op === 'acquire-playback') {
+    const handle = resolveHandle(p)
+    session.setSequential(handle, true)
+    prioritizeFile(handle, p.fileIndex, p.fromOffset ?? 0)
+    return
+  }
+
+  if (op === 'release-playback') {
+    const handle = resolveHandle(p)
+    session.setSequential(handle, false)
+    session.clearPieceDeadlines(handle)
+    const files = session.files(handle)
+    if (files) session.prioritizePieces(handle, new Uint8Array(files.numPieces).fill(4))
+    return
+  }
+
+}
+
+const dispatchRequest = (request: EngineRequest) => {
+  if (!acceptingRequests && request.op !== 'checkpoint' && request.op !== 'checkpoint-and-shutdown') {
+    respond({ kind: 'response', id: request.id, ok: false, error: shuttingDown ? 'worker shutting down' : 'worker not ready' })
+    return
+  }
+
+  const run = () => handleOperation(request.op, request.payload)
+  const operation = request.op === 'read' || request.op === 'checkpoint' || request.op === 'checkpoint-and-shutdown'
+    ? run()
+    : mutationQueue.then(run, run)
+  if (request.op !== 'read' && request.op !== 'checkpoint' && request.op !== 'checkpoint-and-shutdown') {
+    mutationQueue = operation.then(() => {}, () => {})
+  }
+
+  void operation.then(
+    (value) => {
+      if (value instanceof Uint8Array) {
+        respond({ kind: 'response', id: request.id, ok: true, value }, [value.buffer])
+      } else {
+        respond({ kind: 'response', id: request.id, ok: true, value })
+      }
+    },
+    (error) => respond({ kind: 'response', id: request.id, ok: false, error: String(error?.stack ?? error) }),
+  )
+}
+
+const startWithEngineLock = async () => {
+  const locks = (self.navigator as Navigator).locks
+  if (!locks) {
+    postEvent('phase', 'starting')
+    try { await init() } catch (error: any) {
+      postEvent('worker-error', [String(error?.stack ?? error)])
+      postEvent('phase', 'fatal')
+    }
+    return
+  }
+
+  postEvent('phase', 'waiting-for-lock')
+  lockAbort = new AbortController()
+  try {
+    await locks.request(ENGINE_LOCK_NAME, { signal: lockAbort.signal }, async () => {
+      if (shuttingDown) return
+      let release!: () => void
+      const held = new Promise<void>((resolve) => { release = resolve })
+      releaseEngineLock = release
+      postEvent('phase', 'starting')
+      try {
+        await init()
+      } catch (error: any) {
+        postEvent('worker-error', [String(error?.stack ?? error)])
+        postEvent('phase', 'fatal')
+      }
+      if (!session) release()
+      await held
+    })
+  } catch (error: any) {
+    if (!shuttingDown && error?.name !== 'AbortError') {
+      postEvent('worker-error', [String(error?.stack ?? error)])
+      postEvent('phase', 'fatal')
+    }
+  }
+}
+
+const attachEngine = (message: EngineBootstrapMessage) => {
+  if (controlPort) {
+    message.port.close()
+    return
+  }
+  controlPort = message.port
+  controlPort.addEventListener('message', (event: MessageEvent<EngineRequest>) => {
+    const request = event.data
+    if (!request || request.kind !== 'request' || typeof request.id !== 'number' || typeof request.op !== 'string') return
+    dispatchRequest(request)
+  })
+  controlPort.start()
+  void startWithEngineLock()
+}
+
+self.addEventListener('message', (event: MessageEvent<EngineBootstrapMessage>) => {
+  const message = event.data
+  if (message?.kind === 'attach-engine' && message.port instanceof MessagePort) attachEngine(message)
+})

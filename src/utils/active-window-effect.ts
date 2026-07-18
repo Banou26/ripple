@@ -26,6 +26,9 @@ export const useActiveWindow = <T>({ onActive, onInactive }: { onActive?: () => 
       } else if (data === 'check') {
         if (!isActiveRef.current) return
         broadcastChannel.postMessage('active')
+      } else if (data?.type === 'check-active') {
+        if (!isActiveRef.current) return
+        broadcastChannel.postMessage({ type: 'active', buildId: __COMMIT_HASH__ })
       } else if (data === 'active') {
         _resolveActive()
       }
@@ -35,7 +38,7 @@ export const useActiveWindow = <T>({ onActive, onInactive }: { onActive?: () => 
     broadcastChannel.postMessage('check')
     
     const interval = setTimeout(activate, 50)
-    promise.then(() => clearTimeout(interval))
+    void promise.then(() => clearTimeout(interval))
 
     return () => {
       broadcastChannel.removeEventListener('message', handleMessage)

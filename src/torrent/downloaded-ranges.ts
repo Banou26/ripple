@@ -1,4 +1,4 @@
-import type { TorrentSnapshot } from './worker'
+import type { TorrentSnapshot } from './client'
 
 // Merged downloaded regions of one file, as [from, to] byte offsets within the
 // file, derived from the piece bitfield (MSB-first in both engines).

@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import type { AudioStream, PlaybackController } from '../player/playback'
 import type { SubtitleStream } from '../player/subtitles'
 
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { css } from '@emotion/react'
 import { useSearchParams } from 'react-router-dom'
 import { ArrowDown, ArrowUp, User } from 'react-feather'
@@ -11,6 +11,7 @@ import { CaptionsOnIcon, CheckIcon, VolumeHighIcon } from '@videojs/react/icons'
 
 import { getHumanReadableByteString } from '../utils/bytes'
 import { downloadedByteRanges, downloadedFractions } from '../torrent/downloaded-ranges'
+import { magnetInfoHash } from '../torrent/magnet'
 import { usePlayerTorrent } from '../torrent/use-player-torrent'
 import { TooltipDisplay } from '../components/tooltip-display'
 import { useSeekThumbnails } from '../player/thumbnails'
@@ -98,7 +99,8 @@ const Player = () => {
   const { magnet: _magnet, fileIndex: _fileIndex } = Object.fromEntries(searchParams.entries())
   const magnet = useMemo(() => (_magnet ? atob(_magnet) : undefined), [_magnet])
   const fileIndex = useMemo(() => Number(_fileIndex || 0), [_fileIndex])
-  const { snapshot, read, readQuiet, prioritizeFrom } = usePlayerTorrent(magnet, fileIndex)
+  const sourceKey = `${magnet ? magnetInfoHash(magnet) ?? magnet : ''}:${fileIndex}`
+  const { snapshot, engineGeneration, playbackRevoked, read, readQuiet, prioritizeFrom } = usePlayerTorrent(magnet, fileIndex)
 
   const controllerRef = useRef<PlaybackController | null>(null)
   const [subtitleStreams, setSubtitleStreams] = useState<SubtitleStream[]>([])
@@ -115,6 +117,16 @@ const Player = () => {
   const [selectedAudio, setSelectedAudio] = useState<number | undefined>(undefined)
   const [effectiveAudio, setEffectiveAudio] = useState(-1)
   const audioValue = selectedAudio ?? effectiveAudio
+
+  useEffect(() => {
+    controllerRef.current = null
+    setSubtitleStreams([])
+    setSelectedSubtitle(undefined)
+    setAudioStreams([])
+    setSelectedAudio(undefined)
+    setEffectiveAudio(-1)
+    setPlayerReady(false)
+  }, [sourceKey])
 
   const selectedFile = snapshot?.files?.files[fileIndex]
   const fileSize = selectedFile?.size
@@ -168,9 +180,11 @@ const Player = () => {
   const overlay = (
     <div className="ripple-overlay-content">
       <div className="loading-information">
-        {!hasMetadata
-          ? 'Loading metadata…'
-          : `Downloaded ${getHumanReadableByteString(downloaded)}`}
+        {playbackRevoked
+          ? 'Playback moved to another tab'
+          : !hasMetadata
+            ? 'Loading metadata…'
+            : `Downloaded ${getHumanReadableByteString(downloaded)}`}
       </div>
       <div className="media-information">
         <TooltipDisplay
@@ -221,6 +235,9 @@ const Player = () => {
   return (
     <div css={playerStyle}>
       <VideoJsPlayer
+        sourceKey={sourceKey}
+        pipelineGeneration={engineGeneration}
+        suspended={playbackRevoked}
         read={read}
         size={fileSize}
         publicPath={publicPath}
@@ -240,6 +257,7 @@ const Player = () => {
         onController={(controller) => {
           controllerRef.current = controller
           if (controller) setPlayerReady(true)
+          else if (playbackRevoked || !snapshot) setPlayerReady(false)
           // An audio switch rebuilds the pipeline; re-apply the subtitle choice.
           if (controller && selectedSubtitle !== undefined) controller.selectSubtitleStream(selectedSubtitle)
         }}

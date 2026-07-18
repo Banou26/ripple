@@ -1,71 +1,93 @@
+import type { EngineHandle, TorrentSnapshot } from './client'
+
 import { useEffect, useRef, useState } from 'react'
 
-import { createTorrentClient } from './client'
-import type { TorrentClient, TorrentSnapshot } from './client'
+import { magnetInfoHash } from './magnet'
+import { useTorrentClient } from './runtime'
 
 export type PlayerTorrent = {
   snapshot: TorrentSnapshot | null
-  // Reads a byte range of the selected file straight from the Session (which
-  // prioritizes + awaits the covering pieces on demand - ideal for seeking).
+  engineGeneration: number
+  playbackRevoked: boolean
   read: (offset: number, size: number) => Promise<ArrayBuffer>
-  // Same read but without touching piece priorities - for background consumers
-  // (thumbnail generation) that must not fight the playback download order.
   readQuiet: (offset: number, size: number) => Promise<ArrayBuffer>
-  // Re-points download priority at a byte offset of the watched file (seeks).
   prioritizeFrom: (offset: number) => void
 }
 
-// Drives one torrent for the /embed player: adds the magnet, tracks its live
-// snapshot, and exposes a read() bound to the handle once metadata lands.
 export const usePlayerTorrent = (magnet: string | undefined, fileIndex: number): PlayerTorrent => {
-  const clientRef = useRef<TorrentClient | null>(null)
-  const handleRef = useRef<number | null>(null)
+  const client = useTorrentClient()
+  const refRef = useRef<EngineHandle | null>(null)
   const [snapshot, setSnapshot] = useState<TorrentSnapshot | null>(null)
+  const [playbackRevoked, setPlaybackRevoked] = useState(false)
 
   useEffect(() => {
-    if (!magnet) return
-    const client = createTorrentClient()
-    clientRef.current = client
-    client.ready.then(() => client.addMagnet(magnet))
-    let sequentialSet = false
-    const off = client.onState((snaps) => {
-      const snap = snaps.find((s) => s.magnet === magnet) ?? snaps[0] ?? null
-      if (snap) handleRef.current = snap.handle
-      // Watching = stream in order: sequential mode + the watched file first.
-      if (snap?.files && !sequentialSet) {
-        sequentialSet = true
-        client.setSequential(snap.handle, true)
-        client.prioritizeFile(snap.handle, fileIndex)
-      }
-      setSnapshot(snap)
+    const infoHash = magnet ? magnetInfoHash(magnet) : null
+    refRef.current = null
+    setSnapshot(null)
+    setPlaybackRevoked(false)
+    if (!magnet || !infoHash) return
+
+    let disposed = false
+    let leaseAcquired = false
+    let leasePending = false
+    let leaseRef: EngineHandle | undefined
+    const leaseId = crypto.randomUUID()
+    void client.ready.then(() => {
+      if (!disposed) return client.addMagnet(magnet)
+    }).catch(() => {})
+    const offRevoked = client.onPlaybackRevoked((revokedInfoHash) => {
+      if (revokedInfoHash === infoHash && !disposed) setPlaybackRevoked(true)
     })
-    return () => { off(); client.destroy(); clientRef.current = null; handleRef.current = null }
-  }, [magnet, fileIndex])
+    const offState = client.onState((snapshots) => {
+      if (disposed) return
+      const snap = snapshots.find((item) => item.infoHash === infoHash || magnetInfoHash(item.magnet) === infoHash) ?? null
+      refRef.current = snap?.ref ?? null
+      setSnapshot(snap)
+      if (!snap?.files || leaseAcquired || leasePending) return
+      leasePending = true
+      leaseRef = snap.ref
+      void client.acquirePlayback(leaseId, infoHash, snap.ref, fileIndex).then(
+        () => {
+          leasePending = false
+          if (disposed) void client.releasePlayback(leaseId, infoHash, leaseRef).catch(() => {})
+          else leaseAcquired = true
+        },
+        () => { leasePending = false },
+      )
+    })
+    return () => {
+      disposed = true
+      offRevoked()
+      offState()
+      if (leaseAcquired) void client.releasePlayback(leaseId, infoHash, leaseRef).catch(() => {})
+      refRef.current = null
+    }
+  }, [client, magnet, fileIndex])
 
   const readAt = async (offset: number, size: number, prioritize: boolean): Promise<ArrayBuffer> => {
-    const client = clientRef.current
-    const handle = handleRef.current
-    if (!client || handle == null) throw new Error('torrent not ready')
-    // Clamp to the file boundary - the remuxer reads a full buffer near EOF,
-    // but the torrent would otherwise await pieces past the file that never land.
+    const ref = refRef.current
+    if (!ref) throw new Error('torrent not ready')
     const fileSize = snapshot?.files?.files[fileIndex]?.size
     const clamped = fileSize != null ? Math.max(0, Math.min(size, fileSize - offset)) : size
     if (clamped === 0) return new ArrayBuffer(0)
-    const u8 = await client.read(handle, fileIndex, offset, clamped, prioritize)
-    const buf = u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength
-      ? u8.buffer
-      : u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength)
-    return buf as ArrayBuffer
+    const data = await client.read(ref, fileIndex, offset, clamped, prioritize)
+    const buffer = data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
+      ? data.buffer
+      : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+    return buffer as ArrayBuffer
   }
-
-  const read = (offset: number, size: number) => readAt(offset, size, true)
-  const readQuiet = (offset: number, size: number) => readAt(offset, size, false)
 
   const prioritizeFrom = (offset: number) => {
-    const client = clientRef.current
-    const handle = handleRef.current
-    if (client && handle != null) client.prioritizeFile(handle, fileIndex, Math.max(0, Math.floor(offset)))
+    const ref = refRef.current
+    if (ref) void client.prioritizeFile(ref, fileIndex, Math.max(0, Math.floor(offset))).catch(() => {})
   }
 
-  return { snapshot, read, readQuiet, prioritizeFrom }
+  return {
+    snapshot,
+    engineGeneration: snapshot?.engineGeneration ?? 0,
+    playbackRevoked,
+    read: (offset, size) => readAt(offset, size, true),
+    readQuiet: (offset, size) => readAt(offset, size, false),
+    prioritizeFrom,
+  }
 }

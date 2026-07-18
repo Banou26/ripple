@@ -20,6 +20,8 @@ export const syncTorrentToDirectory = async (
   torrent: Torrent,
   root: FileSystemDirectoryHandle,
 ): Promise<number> => {
+  const ref = torrent.ref
+  if (!ref) throw new Error('torrent not ready')
   let written = 0
   for (const [index, file] of (torrent.files ?? []).entries()) {
     const handle = await fileHandleAt(root, file.name)
@@ -28,7 +30,7 @@ export const syncTorrentToDirectory = async (
     try {
       for (let offset = 0; offset < file.size; offset += CHUNK) {
         const len = Math.min(CHUNK, file.size - offset)
-        const chunk = await client.read(Number(torrent.id), index, offset, len)
+        const chunk = await client.read(ref, index, offset, len, false)
         await writable.write(chunk as Uint8Array<ArrayBuffer>)
       }
       await writable.close()

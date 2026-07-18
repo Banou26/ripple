@@ -93,6 +93,9 @@ const MediaAttach = ({ video }: { video: HTMLVideoElement | null }) => {
 }
 
 export type VideoJsPlayerProps = {
+  sourceKey: string
+  pipelineGeneration: number
+  suspended?: boolean
   read: (offset: number, size: number) => Promise<ArrayBuffer>
   size: number | undefined
   publicPath: string
@@ -117,7 +120,7 @@ export type VideoJsPlayerProps = {
 }
 
 export const VideoJsPlayer = ({
-  read, size, publicPath, libavWorkerUrl, jassubWorkerUrl, jassubWasmUrl,
+  sourceKey, pipelineGeneration, suspended = false, read, size, publicPath, libavWorkerUrl, jassubWorkerUrl, jassubWasmUrl,
   defaultFontUrl, autoplay = true, overlay, menu, thumbnails, downloadedRanges,
   audioStreamIndex, onSeek, onSubtitleStreams, onAudioStreams, onController,
 }: VideoJsPlayerProps) => {
@@ -134,8 +137,15 @@ export const VideoJsPlayer = ({
   onAudioStreamsRef.current = onAudioStreams
   const onControllerRef = useRef(onController)
   onControllerRef.current = onController
-  // Changing the audio track restarts the whole pipeline; carry the position over.
+  // Changing the engine or audio track restarts the pipeline; carry the position over.
   const resumeTimeRef = useRef(0)
+  const previousSourceKeyRef = useRef(sourceKey)
+
+  useEffect(() => {
+    if (previousSourceKeyRef.current === sourceKey) return
+    previousSourceKeyRef.current = sourceKey
+    resumeTimeRef.current = 0
+  }, [sourceKey])
 
   // The skin is rendered wholesale, so the downloaded layer is painted into
   // its slider track by hand rather than composed as a React child.
@@ -159,10 +169,10 @@ export const VideoJsPlayer = ({
   }, [downloadedRanges, video])
 
   useEffect(() => {
-    if (!video || !canvas || !size) return
+    if (!video || !canvas || !size || suspended) return
     let controller: PlaybackController | undefined
     let cancelled = false
-    ;(async () => {
+    void (async () => {
       try {
         const ctrl = await startPlayback({
           videoElement: video,
@@ -202,7 +212,7 @@ export const VideoJsPlayer = ({
       controller?.destroy()
       onControllerRef.current?.(null)
     }
-  }, [video, canvas, size, publicPath, libavWorkerUrl, jassubWorkerUrl, jassubWasmUrl, defaultFontUrl, audioStreamIndex])
+  }, [video, canvas, size, publicPath, libavWorkerUrl, jassubWorkerUrl, jassubWasmUrl, defaultFontUrl, audioStreamIndex, sourceKey, pipelineGeneration, suspended])
 
   return (
     <div css={playerStyle} ref={rootRef}>
